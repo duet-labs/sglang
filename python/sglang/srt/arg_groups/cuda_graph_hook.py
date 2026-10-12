@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.connector import ConnectorType
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -259,6 +260,24 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             break
 
 
+def _dsa_prefill_cp_tp_only_bcg(server_args: Any) -> bool:
+    """Prefill-CP hybrid (SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS > 0): short
+    extends run TP-only and replay BCG; CP-sharded batches stay eager, so the
+    CP all_gather replay mismatch cannot occur."""
+    cfg = resolving_view(server_args)
+    min_extend = envs.SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS.get()
+    if not (cfg.enable_prefill_cp and min_extend > 0):
+        return False
+    logger.info(
+        "Breakable prefill CUDA graph kept under context parallel: extends <= "
+        "%d tokens run TP-only and replay the graph; CP-sharded batches stay "
+        "eager (buckets clamped to <= %d).",
+        min_extend,
+        min_extend,
+    )
+    return True
+
+
 def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     """Breakable (segmented capture, no torch.compile). Breakable enforces
     memory-saver rejection in its own __init__; config-time rules can be
@@ -280,7 +299,8 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         (
             "context parallel (attn_cp_size > 1)",
             lambda: resolved_view(server_args).attn_cp_size > 1
-            and not supports_prefill_cp_bcg(server_args),
+            and not supports_prefill_cp_bcg(server_args)
+            and not _dsa_prefill_cp_tp_only_bcg(server_args),
         ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
