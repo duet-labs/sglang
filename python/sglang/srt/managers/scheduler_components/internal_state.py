@@ -196,10 +196,7 @@ class SchedulerInternalStateController:
         # target policy, which is what a captured sampling mask describes.
         if not self.scheduler.spec_algorithm.is_dflash() or float(value) == 1.0:
             return
-        if any(
-            req.return_sampling_mask and not req.finished()
-            for req in request_queries.sampling_mask_reqs(self.scheduler)
-        ):
+        if request_queries.has_active_sampling_mask_req(self.scheduler):
             raise UpdateRejected(
                 f"Updating {key} is rejected while DFlash sampling-mask "
                 "requests are active."

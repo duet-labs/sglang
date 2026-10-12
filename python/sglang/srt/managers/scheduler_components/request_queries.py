@@ -1,10 +1,14 @@
 """Which requests the scheduler holds, and whether any are left.
 
 The accessors below name where each kind of request lives; the queries read
-request holders through them. Idle checks also read the non-request state of
-other components (dLLM staging, decode offload, HiSparse, HiCache), and
-``owning_row_reqs`` reads the tree cache's session records directly. Functions
-take the live ``Scheduler`` and only read it.
+request holders through them, with these exceptions:
+
+- the idle checks also read non-request state of other components (dLLM
+  staging, decode offload, HiSparse, HiCache);
+- ``owning_row_reqs`` reads the tree cache's session records;
+- ``has_active_sampling_mask_req`` reads the PP micro-batches only if present.
+
+Functions take the live ``Scheduler`` and only read it.
 """
 
 from __future__ import annotations
@@ -298,9 +302,9 @@ def owning_row_reqs(scheduler: Scheduler) -> List[Req]:
     return owners
 
 
-def sampling_mask_reqs(scheduler: Scheduler) -> List[Req]:
-    """The queued or running requests, including PP micro-batches and PD decode
-    queues, that a sampling-mask setting change must account for."""
+def has_active_sampling_mask_req(scheduler: Scheduler) -> bool:
+    """Whether any unfinished request holding a sampling mask is queued or
+    running, including PP micro-batches and PD decode queues."""
     batches = [get_running_batch(scheduler), get_last_batch(scheduler)]
     # Read without the PP accessors: a non-PP scheduler has no micro-batches.
     batches.extend(getattr(scheduler, "running_mbs", ()))
@@ -325,7 +329,7 @@ def sampling_mask_reqs(scheduler: Scheduler) -> List[Req]:
         )
         queued.extend(get_decode_retracted_queue(scheduler))
         queued.extend(get_decode_held_rebootstrap_reqs(scheduler))
-    return queued
+    return any(req.return_sampling_mask and not req.finished() for req in queued)
 
 
 # ----------------------------------------------------------------- membership
