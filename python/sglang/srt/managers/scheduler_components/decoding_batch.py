@@ -7,13 +7,15 @@ object it was given in place. ``join``, ``join_launched`` and ``park_for_mix``
 may replace the rows object; the other methods change it in place, so a
 reference to ``rows`` stays valid across them.
 
-The rows are never a step, except in the pipeline PD decode loop and pdmux,
-which still launch the rows themselves. A decode step is a copy of the rows
-(``decode_step``), and the rows take back the fields it rebound (``absorb``)
-before the next plan reads them: its run's, and its commit's too in the loops
-that take it back at the top of that plan. The normal and overlap loops, PD
-decode's included, take it back right after its launch, before its commit, so
-a commit must not rebind a field of the step that the rows need.
+The rows are never a step, except in pdmux, which still launches the rows
+itself. A decode step is a copy of the rows (``decode_step``), and the rows
+take back the fields it rebound (``absorb``) before the next plan reads them:
+its run's, and its commit's too in the loops that take it back after the
+commit. The pipeline PD decode loop takes it back at the ring commit of its
+slot, where the output relay rebinds the step's fields; the other pipeline
+loop and the MLX loop at the top of the next plan. The normal and overlap loops, PD decode's included, take it back
+right after its launch, before its commit, so a commit must not rebind a
+field of the step that the rows need.
 
 The normal and overlap loops change the rows at launch and commit: right after
 a step's run the rows absorb it and the rows whose last prefill chunk it ran

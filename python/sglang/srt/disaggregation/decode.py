@@ -2995,7 +2995,6 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
         self.inflight_steps = InflightQueue(depth=0)
-        self.disagg_decode_launches_copy = True
 
         while True:
             if self.gracefully_exit:
@@ -3046,7 +3045,6 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.inflight_steps = InflightQueue(depth=1)
-        self.disagg_decode_launches_copy = True
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
@@ -3142,11 +3140,12 @@ class SchedulerDisaggregationDecodeMixin:
             ret = None
         else:
             running_batch = self.update_running_batch(decoding_batch)
-            ret = running_batch if not running_batch.is_empty() else None
-            if ret is not None and self.disagg_decode_launches_copy:
+            if not running_batch.is_empty():
                 ret = decoding_batch.decode_step()
+            else:
+                ret = None
 
-        if self.disagg_decode_launches_copy and self.last_batch is not None:
+        if self.last_batch is not None:
             # The step launched last stays last_batch until the loop launches
             # the next one, and the idle checks and request queries read its
             # requests. It is a copy of the rows, or an idle step without
