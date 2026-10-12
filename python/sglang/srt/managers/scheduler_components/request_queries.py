@@ -54,7 +54,8 @@ def get_pp_running_batches(scheduler: Scheduler) -> List[ScheduleBatch]:
 
 
 def get_pp_batches(scheduler: Scheduler) -> List[Optional[ScheduleBatch]]:
-    return scheduler.mbs
+    # Each ring slot's newest launch, committed or not.
+    return get_inflight_steps(scheduler).slot_batches()
 
 
 def get_grammar_queue(scheduler: Scheduler) -> List[Req]:
@@ -307,9 +308,11 @@ def has_active_sampling_mask_req(scheduler: Scheduler) -> bool:
     """Whether any unfinished request holding a sampling mask is queued or
     running, including PP micro-batches and PD decode queues."""
     batches = [get_running_batch(scheduler), get_last_batch(scheduler)]
-    # Read without the PP accessors: a non-PP scheduler has no micro-batches.
+    # Read the PP holders only if present: a non-PP scheduler has no
+    # micro-batches. The pipeline loops install their step ring with last_mbs.
     batches.extend(getattr(scheduler, "running_mbs", ()))
-    batches.extend(getattr(scheduler, "mbs", ()))
+    if hasattr(scheduler, "last_mbs"):
+        batches.extend(get_pp_batches(scheduler))
     batches.extend(getattr(scheduler, "last_mbs", ()))
     queued = [
         *(req for batch in batches if batch is not None for req in batch.reqs),

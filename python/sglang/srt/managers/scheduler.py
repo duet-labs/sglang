@@ -1295,8 +1295,8 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         # Launched batches whose results are not committed yet. The normal,
-        # overlap and PD event loops install their own on entry; the pipeline
-        # and MLX loops keep their own holders.
+        # overlap, PD and pipeline event loops install their own on entry;
+        # the MLX loop keeps its own holder.
         self.inflight_steps = InflightQueue(depth=0)
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
@@ -5266,8 +5266,12 @@ class Scheduler(
         if request_queries.is_idle_for_flush(self):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            # Empty when idle; this resets last_launched with last_batch.
-            self.inflight_steps.drain()
+            # Empty when idle, except a pipeline ring; this resets
+            # last_launched with last_batch. The ring keeps its records,
+            # empty ones included: every rank's relay reads them at the same
+            # positions.
+            if not self.inflight_steps.ring:
+                self.inflight_steps.drain()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
