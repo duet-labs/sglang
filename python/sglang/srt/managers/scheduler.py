@@ -4298,7 +4298,6 @@ class Scheduler(
                 and not running_batch.is_empty()
             ):
                 new_batch.mix_with_running(running_batch)
-                new_batch.decoding_reqs = running_batch.reqs
                 if not self.enable_overlap and not self.spec_algorithm.is_none():
                     # Non-overlap spec never writes the relay; stash the
                     # tails' pending tokens for the mixed input resolve.
@@ -4313,8 +4312,6 @@ class Scheduler(
                 running_batch = ScheduleBatch(
                     reqs=[], batch_is_full=running_batch.batch_is_full
                 )
-        else:
-            new_batch.decoding_reqs = None
 
         return new_batch, running_batch
 
