@@ -8,9 +8,10 @@ result is processed.
 A schedule record also carries what the scheduler's readers (the idle checks
 behind health check, pause and flush, the in-flight set that abort and weight
 updates reach, and the load report) saw at the top of that scheduler
-iteration, where they run. Iterations while the engine is paused plan
-nothing, so each writes those reader values as a ``paused`` record instead;
-the script's yields fix how many there are.
+iteration, where they run, and the number of running rows at the top of the
+plan, once the rows whose finish was committed left. Iterations while the
+engine is paused plan nothing, so each writes those reader values as a
+``paused`` record instead; the script's yields fix how many there are.
 Records hold only what two runs of one commit reproduce: rids are relabeled
 r0, r1, ... in first-seen order, and there are no timestamps or forward_ct.
 
@@ -46,7 +47,7 @@ DIFF_CONTEXT_RECORDS: int = 3
 
 # Bumped whenever records gain, drop or change fields, so a trace written in
 # an older format shows up as a config mismatch instead of a diff.
-TRACE_FORMAT: int = 3
+TRACE_FORMAT: int = 4
 
 # Server args that decide scheduling, recorded in each trace's header.
 HEADER_SERVER_ARGS = (
@@ -76,6 +77,7 @@ class SchedulingTraceWriter:
         self._rid_labels: Dict[str, str] = {}
         self._retraction_counts: Dict[str, int] = {}
         self._readers: Dict[str, Any] = {}
+        self._plan_start_running: Optional[int] = None
         self._write({"kind": "header", **header})
 
     @classmethod
@@ -124,11 +126,24 @@ class SchedulingTraceWriter:
         if scheduler._engine_paused:
             self._write({"kind": "paused", "step": self._step, **self._readers})
 
+    def observe_plan_start(self, running_batch: ScheduleBatch) -> None:
+        """Count the running rows once finished rows left at the top of a plan,
+        for the next schedule record."""
+        self._plan_start_running = len(running_batch.reqs)
+
     def record_schedule(self, scheduler: Scheduler, plan: NextBatchPlan) -> None:
         self._step += 1
         batch = plan.batch_to_run
         batch_reqs = batch.reqs if batch is not None else []
         chunked = scheduler.chunked_req
+        # A mixed step takes the decode rows out of the running batch for the
+        # step; they are still running, so they are recorded as such.
+        running = plan.running_batch.reqs or (
+            batch.reqs[batch.first_decode_row :]
+            if batch is not None and batch.forward_mode.is_mixed()
+            else []
+        )
+        plan_start_running, self._plan_start_running = self._plan_start_running, None
         record: Dict[str, Any] = {
             "kind": "schedule",
             "step": self._step,
@@ -140,7 +155,8 @@ class SchedulingTraceWriter:
             record["prefix_lens"] = list(batch.prefix_lens)
         record.update(
             chunked=self._label(chunked.rid) if chunked is not None else None,
-            running=self._labels(plan.running_batch.reqs),
+            running=self._labels(running),
+            plan_start_running=plan_start_running,
             waiting=self._labels(scheduler.waiting_queue),
             # None also when no skip check ran (dLLM, deferred prefill, PD
             # decode) or a later check held admission (min free slots).
