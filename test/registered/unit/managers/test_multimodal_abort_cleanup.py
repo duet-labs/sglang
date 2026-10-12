@@ -98,7 +98,8 @@ def _queued_scheduler(req):
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
     scheduler.grammar_manager = MagicMock()
-    scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.running_batch = scheduler.last_batch = None
+    scheduler.enable_continuous_input_polling = False
     return scheduler
 
 

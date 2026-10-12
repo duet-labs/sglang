@@ -13,11 +13,11 @@ class SchedulerFlushWrapper:
         self,
         *,
         flush_cache: Callable[[], bool],
-        is_fully_idle: Callable[[], bool],
+        is_idle: Callable[[], bool],
         ipc_channels: SchedulerIpcChannels,
     ) -> None:
         self._flush_cache = flush_cache
-        self._is_fully_idle = is_fully_idle
+        self._is_idle = is_idle
         self._ipc_channels = ipc_channels
         self._pending: Optional[Tuple[FlushCacheReqInput, float]] = None
 
@@ -32,7 +32,7 @@ class SchedulerFlushWrapper:
         if timeout_s <= 0.0:
             return FlushCacheReqOutput(success=self._flush_cache())
 
-        if self._is_fully_idle():
+        if self._is_idle():
             return FlushCacheReqOutput(success=self._flush_cache())
 
         self._pending = (recv_req, time.monotonic() + timeout_s)
@@ -44,7 +44,7 @@ class SchedulerFlushWrapper:
 
         pending_req, deadline = self._pending
 
-        if self._is_fully_idle():
+        if self._is_idle():
             success = self._flush_cache()
             self._pending = None
             self._ipc_channels.send_to_tokenizer.send_output(

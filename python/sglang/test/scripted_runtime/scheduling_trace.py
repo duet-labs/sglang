@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components import request_queries
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
@@ -110,11 +111,11 @@ class SchedulingTraceWriter:
         """
         load = scheduler.load_inquirer.get_loads()
         self._readers = {
-            "idle": scheduler.is_fully_idle(),
-            "idle_ignore_waiting": scheduler.is_fully_idle(ignore_waiting=True),
+            "idle": request_queries.is_idle(scheduler),
+            "idle_ignore_waiting": request_queries.is_idle_ignoring_waiting(scheduler),
             # The reqs abort-all and weight-version changes reach. A set, so
             # sorted; each was already labeled by an earlier schedule record.
-            "inflight": sorted(self._labels(scheduler.collect_inflight_reqs())),
+            "inflight": sorted(self._labels(request_queries.inflight_reqs(scheduler))),
             "load": {
                 "running": load.num_running_reqs,
                 "waiting": load.num_waiting_reqs,

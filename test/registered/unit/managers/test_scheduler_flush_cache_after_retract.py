@@ -1,6 +1,6 @@
 import unittest
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -9,6 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -46,7 +47,11 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
-        scheduler._pp_microbatches_drained = MagicMock(return_value=True)
+        pp_patcher = patch.object(
+            request_queries, "_pp_microbatches_drained", return_value=True
+        )
+        pp_patcher.start()
+        self.addCleanup(pp_patcher.stop)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
@@ -99,14 +104,14 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         self.assertFalse(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_not_called()
 
-    def test_is_fully_idle_default_ignores_nothing(self):
-        """Regression guard: every other is_fully_idle() caller passes no args,
+    def test_is_idle_ignores_nothing(self):
+        """Regression guard: every other idle caller uses is_idle(),
         so a non-empty waiting_queue must still report not-idle by default."""
         scheduler = self._new_scheduler()
         scheduler.waiting_queue = [_make_req(is_retracted=True)]
 
-        self.assertFalse(scheduler.is_fully_idle())
-        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
+        self.assertFalse(request_queries.is_idle(scheduler))
+        self.assertTrue(request_queries.is_idle_ignoring_waiting(scheduler))
 
     def test_flush_cache_does_not_ignore_waiting_reqs_while_unpaused(self):
         """ignore_waiting is gated on _engine_paused inside flush_cache — a

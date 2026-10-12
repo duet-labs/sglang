@@ -296,9 +296,6 @@ class _ContextStub:
 
 
 class _SchedulerStub:
-    _collect_inflight_batches = Scheduler._collect_inflight_batches
-    collect_inflight_reqs = Scheduler.collect_inflight_reqs
-
     def __init__(
         self,
         version,

@@ -36,7 +36,7 @@ The control path is:
 ***
 ## 2. Idle-state requirement (strict)
 
-The Scheduler uses `is_fully_idle()` which checks:
+The Scheduler uses `request_queries.is_idle()` which checks:
 
 - No running batches (including chunked prefill, overlap, pipeline-parallel, and disaggregation paths)
 - No waiting requests in any queue (waiting, grammar, disagg bootstrap/prealloc/transfer/inflight)

@@ -7,6 +7,7 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -46,8 +47,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def _scheduler(
         self, *, inflight=(), waiting=(), chunked=None, staging=()
     ) -> SimpleNamespace:
+        patcher = patch.object(
+            request_queries, "inflight_reqs", return_value=set(inflight)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
             waiting_queue=list(waiting),
             chunked_req=chunked,
             hisparse_coordinator=(
@@ -155,7 +160,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             ),
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
-            is_fully_idle=lambda **kwargs: True,
+            is_idle_for_flush=lambda: True,
             scheduler=SimpleNamespace(
                 record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version

@@ -16,15 +16,15 @@ class TestSchedulerFlushCache(unittest.TestCase):
     def _new_scheduler(self) -> SimpleNamespace:
         """The wrapper plus the three collaborators it was handed."""
         flush_cache = MagicMock(return_value=True)
-        is_fully_idle = MagicMock(return_value=False)
+        is_idle = MagicMock(return_value=False)
         ipc_channels = MagicMock()
         return SimpleNamespace(
             flush_cache=flush_cache,
-            is_fully_idle=is_fully_idle,
+            is_idle=is_idle,
             ipc_channels=ipc_channels,
             flush_wrapper=SchedulerFlushWrapper(
                 flush_cache=flush_cache,
-                is_fully_idle=is_fully_idle,
+                is_idle=is_idle,
                 ipc_channels=ipc_channels,
             ),
         )
@@ -42,7 +42,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
     def test_immediate_flush_when_idle(self):
         """Positive timeout but already idle → flush immediately."""
         scheduler = self._new_scheduler()
-        scheduler.is_fully_idle.return_value = True
+        scheduler.is_idle.return_value = True
 
         output = scheduler.flush_wrapper.handle(FlushCacheReqInput(timeout_s=5.0))
 
@@ -81,7 +81,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
     def test_pending_flush_completes_on_idle(self):
         scheduler = self._new_scheduler()
-        scheduler.is_fully_idle.return_value = True
+        scheduler.is_idle.return_value = True
         req = FlushCacheReqInput(timeout_s=1.0)
         scheduler.flush_wrapper._pending = (req, 111.0)
 

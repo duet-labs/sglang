@@ -222,6 +222,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -1301,7 +1302,7 @@ class Scheduler(
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
-            is_fully_idle=self.is_fully_idle,
+            is_idle=lambda: request_queries.is_idle(self),
             ipc_channels=self.ipc_channels,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
@@ -2102,6 +2103,9 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        if envs.SGLANG_DEBUG_REQUEST_MEMBERSHIP.get():
+            request_queries.assert_single_membership(self)
+
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
@@ -2142,9 +2146,9 @@ class Scheduler(
                 vmm_errors = self._materialize_cuda_vmm_inputs(recv_req)
 
             # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
+            if is_health_check_generate_req(
+                recv_req
+            ) and not request_queries.is_idle_for_health_check(self):
                 self.return_health_check_ipcs.append(
                     getattr(recv_req, "http_worker_ipc", None)
                 )
@@ -2282,7 +2286,7 @@ class Scheduler(
             draft_worker=self.draft_worker,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
-            is_fully_idle=self.is_fully_idle,
+            is_idle_for_flush=lambda: request_queries.is_idle_for_flush(self),
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
@@ -2421,8 +2425,7 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
-            get_chunked_req=lambda: self.chunked_req,
+            get_owning_row_reqs=lambda: request_queries.owning_row_reqs(self),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -3481,7 +3484,7 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            inflight_batches = self._collect_inflight_batches()
+            inflight_batches = request_queries.inflight_batches(self)
             seen_rids = set()
             for batch in inflight_batches:
                 if batch is None:
@@ -5057,7 +5060,7 @@ class Scheduler(
         # path is polled repeatedly, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
-        fully_idle = self.is_fully_idle()
+        fully_idle = request_queries.is_idle(self)
         if not fully_idle:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
             now = time.monotonic()
@@ -5135,87 +5138,10 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
-        if self.is_fully_idle():
+        if request_queries.is_idle(self):
             self.metrics_reporter.record_scheduler_idle()
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
-
-    def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
-        # Health check piggybacks on running requests in process_output.
-        # Only running_batch + waiting_queue guarantee active GPU processing;
-        # disagg queues (bootstrap/prealloc/transfer) may have items without
-        # any request actually running on GPU — e.g. stuck handshake, full
-        # KV cache, or stalled transfer — so they can't carry health info.
-        # Batch running status
-        idle = (
-            self.running_batch.is_empty()
-            and self.chunked_req is None
-            and not self.dllm_manager.any_staging_reqs()
-            and (self.last_batch is None or self.last_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
-            and self._pp_microbatches_drained()
-        )
-
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        if not ignore_waiting:
-            idle &= len(self.waiting_queue) == 0
-        else:
-            # A PD-decode request waiting with its transferred KV still owns
-            # its request row; a flush would free it.
-            idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
-
-        if (
-            for_health_check
-            and not self._engine_paused
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-
-        if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_inflight_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
-
-            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
-            # destructive operations like attach/detach/flush_cache.
-            if self.enable_hierarchical_cache:
-                tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
-                idle &= len(tc.ongoing_load_back) == 0
-                if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
-                    idle &= len(tc.ongoing_backup) == 0
-                    if get_memory().hicache_host_memory_mode == "buffer_only":
-                        # Queued writes, staged prefetches, and in-flight
-                        # storage writes still hold host staging
-                        # (buffer-mode unified tree only).
-                        idle &= tc.buffer_pipeline.is_idle()
-            elif self.enable_lmcache:
-                idle &= not self.tree_cache.has_pending_cache_operations()
-
-        return idle
-
-    def _pp_microbatches_drained(self) -> bool:
-        if get_parallel().pp_size == 1:
-            return True
-        return all(x.is_empty() for x in self.running_mbs) and all(
-            mb is None or mb.is_empty() for mb in self.mbs
-        )
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -5225,7 +5151,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
+        if not request_queries.is_idle(self):
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -5281,7 +5207,7 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
+        if not request_queries.is_idle(self):
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -5322,7 +5248,7 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self._engine_paused):
+        if request_queries.is_idle_for_flush(self):
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -5398,37 +5324,11 @@ class Scheduler(
         old_version = get_serving().weight_version
         get_context().override("scheduler.weight_version", weight_version=new_version)
 
-        live_reqs = {
-            *self.collect_inflight_reqs(),
-            *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
-        }
-        if self.hisparse_coordinator is not None:
-            live_reqs.update(
-                act.req for act in self.hisparse_coordinator.ack_staging_queue
-            )
+        live_reqs = request_queries.weight_version_reqs(self)
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
         )
-
-    def collect_inflight_reqs(self) -> Set[Req]:
-        return {
-            req
-            for batch in self._collect_inflight_batches()
-            if batch is not None
-            for req in batch.reqs
-        }
-
-    def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
-        if get_parallel().pp_size == 1:
-            inflight_batches = [self.running_batch, self.last_batch]
-        else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
-        if self.enable_continuous_input_polling and self.result_queue:
-            # Polling can run intake before the newest queued batch becomes last_batch.
-            inflight_batches.extend(batch for batch, _ in self.result_queue)
-        return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
@@ -5557,7 +5457,7 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        for req in self.collect_inflight_reqs():
+        for req in request_queries.inflight_reqs(self):
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
@@ -5602,38 +5502,11 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
 
-        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
-        if (
-            self.last_batch is not None
-            and self.last_batch.forward_mode.is_extend()
-            # A running batch that DP attention converted to extend is
-            # last_batch itself; its requests are already listed above.
-            and self.last_batch is not self.running_batch
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        retract_reqs = request_queries.retract_on_pause_reqs(self)
+        if self.disaggregation_mode == DisaggregationMode.DECODE and any(
+            r.kv.holds_kv for r in self.waiting_queue
         ):
-            retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
-
-        if (
-            self.chunked_req is not None
-            and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs.append(self.chunked_req)
-
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Transferred requests wait for a slot holding their row and KV;
-            # retract them too, so their KV is rebuilt under the new weights.
-            staged = [r for r in self.waiting_queue if r.kv.holds_kv]
-            if staged:
-                self.waiting_queue = [
-                    r for r in self.waiting_queue if not r.kv.holds_kv
-                ]
-                retract_reqs += staged
+            self.waiting_queue = [r for r in self.waiting_queue if not r.kv.holds_kv]
 
         self.last_batch = None
         self.cur_batch_for_debug = None

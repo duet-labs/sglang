@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.scheduling_trace import (
@@ -73,11 +75,20 @@ class TestSchedulingTraceWriter(CustomTestCase):
                     num_running_reqs=0, num_waiting_reqs=1
                 )
             ),
-            is_fully_idle=lambda ignore_waiting=False: ignore_waiting,
-            # Unordered in the scheduler (a set): the record sorts the labels.
-            collect_inflight_reqs=lambda: [inflight[1], inflight[0]],
         )
-        with tempfile.TemporaryDirectory() as tmp:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(request_queries, "is_idle", return_value=False),
+            patch.object(
+                request_queries, "is_idle_ignoring_waiting", return_value=True
+            ),
+            # Unordered in the scheduler (a set): the record sorts the labels.
+            patch.object(
+                request_queries,
+                "inflight_reqs",
+                return_value=[inflight[1], inflight[0]],
+            ),
+        ):
             path = Path(tmp, "t.jsonl")
             writer = SchedulingTraceWriter(path, {})
             writer._labels(inflight)

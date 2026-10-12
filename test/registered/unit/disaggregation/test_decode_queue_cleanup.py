@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -539,7 +540,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
 
-        self.assertFalse(scheduler.is_fully_idle())
+        self.assertFalse(request_queries.is_idle(scheduler))
 
 
 class _GateReceiver:

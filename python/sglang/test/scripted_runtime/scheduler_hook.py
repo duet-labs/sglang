@@ -13,6 +13,7 @@ import zmq
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
@@ -68,7 +69,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     logger.info("scripted_runtime: driving engine until server warmup completes")
     start_time = time.monotonic()
 
-    # is_fully_idle() can transiently report idle while a PP microbatch result
+    # is_idle() can transiently report idle while a PP microbatch result
     # is still in flight, so require it to hold for two full microbatch
     # rotations after the warmup request was observed on the recv socket.
     quiesce_iters = 2 * (cfg.pp_size + cfg.pp_async_batch_depth)
@@ -85,7 +86,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
                 f"idle_streak={idle_streak})"
             )
         yield
-        if proxy.work_reqs_seen > 0 and scheduler.is_fully_idle():
+        if proxy.work_reqs_seen > 0 and request_queries.is_idle(scheduler):
             idle_streak += 1
         else:
             idle_streak = 0
@@ -107,7 +108,7 @@ def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     ctx.abort_all()
     for _ in range(RESET_DRAIN_MAX_STEPS):
         yield
-        if scheduler.is_fully_idle():
+        if request_queries.is_idle(scheduler):
             break
     else:
         raise RuntimeError(

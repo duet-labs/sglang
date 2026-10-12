@@ -90,7 +90,7 @@ class SchedulerWeightUpdaterManager:
     draft_worker: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
-    is_fully_idle: Callable[..., bool]
+    is_idle_for_flush: Callable[[], bool]
     scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
@@ -336,9 +336,9 @@ class SchedulerWeightUpdaterManager:
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        assert self.is_fully_idle(
-            ignore_waiting=scheduler is not None and scheduler._engine_paused
-        ), "release_memory_occupation should be called only when server is idle."
+        assert self.is_idle_for_flush(), (
+            "release_memory_occupation should be called only when server is idle."
+        )
 
         tags = recv_req.tags
 

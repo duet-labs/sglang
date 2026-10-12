@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -44,7 +45,16 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         )
 
         _check_kv_page_invariants = _RIC._check_kv_page_invariants
-        _requests_owning_rows = _RIC._requests_owning_rows
+
+        def get_owning_row_reqs(self):
+            return request_queries.owning_row_reqs(
+                SimpleNamespace(
+                    last_batch=self.get_last_batch(),
+                    running_batch=self.get_running_batch(),
+                    chunked_req=self.get_chunked_req(),
+                    tree_cache=self.tree_cache,
+                )
+            )
 
     return _FakeChecker(), rtt, tc, alloc
 

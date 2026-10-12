@@ -8,6 +8,7 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
@@ -15,6 +16,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,7 +36,9 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
         scheduler.enable_hicache_storage = False
-        scheduler.is_fully_idle = lambda: True
+        idle_patcher = patch.object(request_queries, "is_idle", return_value=True)
+        idle_patcher.start()
+        self.addCleanup(idle_patcher.stop)
         scheduler.tree_cache = SimpleNamespace(
             attach_storage_backend=lambda **kwargs: (True, "attached"),
             detach_storage_backend=lambda: (True, "detached"),

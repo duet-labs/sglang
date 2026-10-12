@@ -27,6 +27,7 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ReqKvInfo,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components import request_queries  # noqa: E402
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.observability import req_time_stats
@@ -417,12 +418,12 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
         scheduler.disagg_prefill_inflight_queue = []
-        scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
 
         with (
             patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
             patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
+            patch.object(request_queries, "inflight_reqs", return_value=set()),
         ):
             get_serving.return_value.weight_version = None
             scheduler.abort_request(AbortReq(rid="req"))

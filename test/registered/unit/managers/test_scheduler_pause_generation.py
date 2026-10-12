@@ -24,6 +24,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -264,11 +265,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def test_paused_engine_accounting_uses_current_scheduler_state(self):
         scheduler = self._new_scheduler()
-        scheduler.is_fully_idle = MagicMock()
 
         for is_idle in (True, False):
-            with self.subTest(is_idle=is_idle):
-                scheduler.is_fully_idle.return_value = is_idle
+            with (
+                self.subTest(is_idle=is_idle),
+                patch.object(request_queries, "is_idle", return_value=is_idle),
+            ):
                 scheduler.metrics_reporter.reset_mock()
 
                 scheduler._record_scheduler_state_for_paused_engine()

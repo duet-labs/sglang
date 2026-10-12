@@ -64,11 +64,8 @@ class SchedulerInvariantChecker:
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
-    get_running_batch: Callable
+    get_owning_row_reqs: Callable[[], List[Req]]
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The chunked-prefill request parked between chunks is in neither batch;
-    # it still owns its KV row.
-    get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -271,34 +268,11 @@ class SchedulerInvariantChecker:
         )
         return active_leak or int8_leak, active_msg + "\n" + int8_msg
 
-    def _requests_owning_rows(self) -> List[Req]:
-        last_batch = self.get_last_batch()
-        running_batch = self.get_running_batch()
-        reqs = [] if last_batch is None else list(last_batch.reqs)
-        # After decode running_batch IS last_batch. Compare by identity:
-        # ScheduleBatch's dataclass __eq__ compares tensors and raises.
-        if running_batch is not None and running_batch is not last_batch:
-            reqs += running_batch.reqs
-        chunked_req = self.get_chunked_req()
-        if chunked_req is not None:
-            reqs.append(chunked_req)
-
-        # A request running on a session's record does not own that row.
-        session_kvs = {id(kv) for kv in self.tree_cache.session_records().values()}
-        owners, seen = [], set()
-        for req in reqs:
-            if id(req) in seen:
-                continue
-            seen.add(id(req))
-            if req.kv.holds_kv and id(req.kv) not in session_kvs:
-                owners.append(req)
-        return owners
-
     def _get_total_uncached_sizes(self) -> Tuple[int, int]:
         """(full, swa) footprint of the KV rows requests own; 0 swa off hybrid-SWA."""
         full_uncached = 0
         swa_uncached = self.tree_cache.swa_transient_size()
-        for req in self._requests_owning_rows():
+        for req in self.get_owning_row_reqs():
             assert req.kv.cache_protected_len % self.page_size == 0
             full_uncached += kv_private_tokens(req.kv, self.page_size)
             if self.is_hybrid_swa:
@@ -360,7 +334,7 @@ class SchedulerInvariantChecker:
             owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
         owners: list[tuple[str, Optional[int], int]] = []
-        for req in self._requests_owning_rows():
+        for req in self.get_owning_row_reqs():
             _add_owner(f"req {req.rid}", req.kv)
         for sid, kv in self.tree_cache.session_records().items():
             if kv.holds_kv:

@@ -26,6 +26,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -213,7 +214,7 @@ class TestRunningTimeout(CustomTestCase):
                 with envs.SGLANG_REQ_RUNNING_TIMEOUT.override(1.0):
                     aborts = s._poll_timeout_aborts()
                     # Abort and weight-version updates share this request inventory.
-                    self.assertEqual(s.collect_inflight_reqs(), {older, newer})
+                    self.assertEqual(request_queries.inflight_reqs(s), {older, newer})
 
                 self.assertEqual(
                     [a.rid for a in aborts],

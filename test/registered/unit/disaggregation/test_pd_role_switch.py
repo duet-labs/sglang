@@ -11,6 +11,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components import request_queries  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -41,7 +42,9 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         rc.get_context().set_server_args(sa)
         s.server_args = sa
-        s.is_fully_idle = MagicMock(return_value=idle)
+        idle_patcher = patch.object(request_queries, "is_idle", return_value=idle)
+        idle_patcher.start()
+        self.addCleanup(idle_patcher.stop)
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)

@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components import request_queries
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -28,7 +29,10 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
-        s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
+        # Stalled, not idle.
+        idle_patcher = patch.object(request_queries, "is_idle", return_value=False)
+        idle_patcher.start()
+        self.addCleanup(idle_patcher.stop)
         s.publish_load_snapshot = MagicMock(return_value=None)
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()
