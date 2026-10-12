@@ -249,10 +249,9 @@ def retract_on_pause_reqs(scheduler: Scheduler) -> Tuple[List[Req], List[Req]]:
     retract_reqs = [r for r in running_batch.reqs if not r.finished()]
     if (
         last_batch is not None
-        and last_batch.forward_mode.is_extend()
-        # A running batch that DP attention converted to extend is
-        # last_batch itself; its requests are already listed above.
-        and last_batch is not running_batch
+        # A step without prefill rows is the DP extend view of a decode step;
+        # its requests are the running ones, already listed above.
+        and last_batch.has_prefill_rows()
         # Skip merge for disagg prefill: completed prefill requests are
         # already in disagg_prefill_inflight_queue. Merging them into
         # running_batch leaks them, since the prefill event loop never
@@ -283,8 +282,9 @@ def owning_row_reqs(scheduler: Scheduler) -> List[Req]:
     last_batch = get_last_batch(scheduler)
     running_batch = get_running_batch(scheduler)
     reqs = [] if last_batch is None else list(last_batch.reqs)
-    # After decode running_batch IS last_batch. Compare by identity:
-    # ScheduleBatch's dataclass __eq__ compares tensors and raises.
+    # A decode step lists the running requests again; the loop below skips
+    # repeats. Compare by identity: ScheduleBatch's dataclass __eq__ compares
+    # tensors and raises.
     if running_batch is not None and running_batch is not last_batch:
         reqs += running_batch.reqs
     # The chunked-prefill request parked between chunks is in neither batch;

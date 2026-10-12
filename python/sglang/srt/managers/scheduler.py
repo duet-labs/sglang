@@ -3778,6 +3778,9 @@ class Scheduler(
     def get_next_batch_to_run(
         self, decoding_batch: DecodingBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        # The last decode step from these rows has run and committed (overlap
+        # commits a copy of it), so the rows take back what its run rebound.
+        decoding_batch.absorb()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -3812,11 +3815,9 @@ class Scheduler(
                 decoding_batch.join(new_batch)
                 decoding_batch.rows.hisparse_coordinator = self.hisparse_coordinator
 
-        if (
-            not self.enable_hisparse
-            and last_batch
-            and last_batch.forward_mode.is_extend()
-        ):
+        # A step without prefill rows is the DP extend view of a decode step:
+        # its rows are the running rows, and the leave below drops the finished.
+        if not self.enable_hisparse and last_batch and last_batch.has_prefill_rows():
             if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -3828,10 +3829,8 @@ class Scheduler(
             # Filter batch
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
 
-            # Merge the new batch into the running batch. A running batch that
-            # DP attention converted to extend is last_batch itself: filtered
-            # in place above, nothing to merge.
-            if not last_batch.is_empty() and last_batch is not decoding_batch.rows:
+            # Merge the new batch into the running batch
+            if not last_batch.is_empty():
                 decoding_batch.join(last_batch)
 
         # Rows whose finish a commit already observed leave before admission,
@@ -3911,14 +3910,13 @@ class Scheduler(
             and self.select_decode_rows(decoding_batch, retract=True)
             and not decoding_batch.rows.is_empty()
         ):
-            return decoding_batch.rows
+            return decoding_batch.decode_step()
         return None
 
     def _finalize_step(self, ret: Optional[ScheduleBatch]) -> Optional[ScheduleBatch]:
         """Prepare the gathered batch to run: DP extend view, ngram inputs, timing."""
         # Decode->extend conversion keeps a heterogeneous dp step replayable.
-        # A converted running batch stays the running batch; next step it comes
-        # back as last_batch and is filtered in place, not merged with itself.
+        # It converts the decode step; the running rows keep decoding.
         ret = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
         self._arm_prefill_decode_interval(ret)
 
