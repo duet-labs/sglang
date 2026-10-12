@@ -2054,11 +2054,11 @@ class Scheduler(
 
     def _debug_check_commit_gate(self, last_batch_gate: bool) -> None:
         # A record is due exactly when the last_batch gate would commit.
-        if envs.SGLANG_DEBUG_REQUEST_MEMBERSHIP.get():
+        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
             assert self.inflight_steps.has_due() == last_batch_gate
 
     def _debug_check_last_launched(self) -> None:
-        if envs.SGLANG_DEBUG_REQUEST_MEMBERSHIP.get():
+        if envs.SGLANG_DEBUG_INFLIGHT_STEPS.get():
             assert self.inflight_steps.last_launched is self.last_batch
 
     def is_disable_overlap_for_batch(

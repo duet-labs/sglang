@@ -496,9 +496,11 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     # On each ingest_requests call (several per step under continuous input
-    # polling): no request is in two request containers at once. Each step:
-    # the in-flight step queue agrees with last_batch.
+    # polling): no request is in two request containers at once.
     SGLANG_DEBUG_REQUEST_MEMBERSHIP = EnvBool(False)
+    # Each event loop step: the in-flight step queue commits exactly when the
+    # last_batch gate would, and its last launched batch is last_batch.
+    SGLANG_DEBUG_INFLIGHT_STEPS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
