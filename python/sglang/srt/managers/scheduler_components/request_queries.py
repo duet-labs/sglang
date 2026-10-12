@@ -1,8 +1,10 @@
 """Which requests the scheduler holds, and whether any are left.
 
-Each query reads its holders only through the accessors below, so where a kind
-of request lives is stated once. Functions take the live ``Scheduler`` and only
-read it.
+The accessors below name where each kind of request lives; the queries read
+request holders through them. Idle checks also read the non-request state of
+other components (dLLM staging, decode offload, HiSparse, HiCache), and
+``owning_row_reqs`` reads the tree cache's session records directly. Functions
+take the live ``Scheduler`` and only read it.
 """
 
 from __future__ import annotations
