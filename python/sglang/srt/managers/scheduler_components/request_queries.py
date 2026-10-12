@@ -13,7 +13,7 @@ Functions take the live ``Scheduler`` and only read it.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Deque, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_memory, get_parallel
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 
 
 # ----------------------------------------------------------------- holders
@@ -43,8 +44,8 @@ def get_chunked_req(scheduler: Scheduler) -> Optional[Req]:
     return scheduler.chunked_req
 
 
-def get_result_queue(scheduler: Scheduler) -> Deque:
-    return scheduler.result_queue
+def get_inflight_steps(scheduler: Scheduler) -> InflightQueue:
+    return scheduler.inflight_steps
 
 
 def get_pp_running_batches(scheduler: Scheduler) -> List[ScheduleBatch]:
@@ -135,7 +136,7 @@ def _is_idle(
         and get_chunked_req(scheduler) is None
         and not scheduler.dllm_manager.any_staging_reqs()
         and (get_last_batch(scheduler) is None or get_last_batch(scheduler).is_empty())
-        and (not scheduler.enable_overlap or len(get_result_queue(scheduler)) == 0)
+        and (not scheduler.enable_overlap or len(get_inflight_steps(scheduler)) == 0)
         and _pp_microbatches_drained(scheduler)
     )
 
@@ -210,9 +211,9 @@ def inflight_batches(scheduler: Scheduler) -> list[ScheduleBatch | None]:
         batches = [get_running_batch(scheduler), get_last_batch(scheduler)]
     else:
         batches = [*get_pp_running_batches(scheduler), *get_pp_batches(scheduler)]
-    if scheduler.enable_continuous_input_polling and get_result_queue(scheduler):
+    if scheduler.enable_continuous_input_polling and get_inflight_steps(scheduler):
         # Polling can run intake before the newest queued batch becomes last_batch.
-        batches.extend(batch for batch, _ in get_result_queue(scheduler))
+        batches.extend(record.batch for record in get_inflight_steps(scheduler))
     return batches
 
 
@@ -339,7 +340,7 @@ def assert_single_membership(scheduler: Scheduler) -> None:
     """No request is in two of the containers that hold it between iterations.
 
     A request may be in none of them: a just-prefilled one lives only in
-    last_batch until the next merge. last_batch, result_queue and the PP
+    last_batch until the next merge. last_batch, inflight_steps and the PP
     micro-batch lists index requests already counted here, and the PD
     pending-DP-rank and dLLM staging queues are subsets of the prealloc and
     dLLM waiting queues, so none of those is a container. Only distinct
