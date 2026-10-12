@@ -6,7 +6,8 @@ request holders through them, with these exceptions:
 - the idle checks also read non-request state of other components (dLLM
   staging, decode offload, HiSparse, HiCache);
 - ``owning_row_reqs`` reads the tree cache's session records;
-- ``has_active_sampling_mask_req`` reads the PP micro-batches only if present.
+- ``has_active_sampling_mask_req`` reads the PP micro-batches only under a
+  pipeline loop.
 
 Functions take the live ``Scheduler`` and only read it.
 """
@@ -308,12 +309,11 @@ def has_active_sampling_mask_req(scheduler: Scheduler) -> bool:
     """Whether any unfinished request holding a sampling mask is queued or
     running, including PP micro-batches and PD decode queues."""
     batches = [get_running_batch(scheduler), get_last_batch(scheduler)]
-    # Read the PP holders only if present: a non-PP scheduler has no
-    # micro-batches. The pipeline loops install their step ring with last_mbs.
-    batches.extend(getattr(scheduler, "running_mbs", ()))
-    if hasattr(scheduler, "last_mbs"):
+    # Only a pipeline loop installs a ring, together with its micro-batches.
+    if get_inflight_steps(scheduler).ring:
+        batches.extend(get_pp_running_batches(scheduler))
         batches.extend(get_pp_batches(scheduler))
-    batches.extend(getattr(scheduler, "last_mbs", ()))
+        batches.extend(scheduler.last_mbs)
     queued = [
         *(req for batch in batches if batch is not None for req in batch.reqs),
         *get_waiting_queue(scheduler),
