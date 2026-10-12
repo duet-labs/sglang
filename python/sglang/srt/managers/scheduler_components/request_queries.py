@@ -342,7 +342,8 @@ def assert_single_membership(scheduler: Scheduler) -> None:
     last_batch until the next merge. last_batch, result_queue and the PP
     micro-batch lists index requests already counted here, and the PD
     pending-DP-rank and dLLM staging queues are subsets of the prealloc and
-    dLLM waiting queues, so none of those is a container.
+    dLLM waiting queues, so none of those is a container. Only distinct
+    containers are compared: a request listed twice in one is not flagged.
     """
     chunked_req = get_chunked_req(scheduler)
     containers = {
@@ -353,8 +354,11 @@ def assert_single_membership(scheduler: Scheduler) -> None:
         "hisparse_staging": get_hisparse_staging_reqs(scheduler),
     }
     if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-        containers["prefill_bootstrap"] = get_prefill_bootstrap_queue(scheduler)
-        containers["prefill_inflight"] = get_prefill_inflight_queue(scheduler)
+        # A failed role switch can leave the PD queues unset.
+        if scheduler.disagg_prefill_bootstrap_queue is not None:
+            containers["prefill_bootstrap"] = get_prefill_bootstrap_queue(scheduler)
+        if scheduler.disagg_prefill_inflight_queue is not None:
+            containers["prefill_inflight"] = get_prefill_inflight_queue(scheduler)
     if (
         scheduler.disaggregation_mode == DisaggregationMode.DECODE
         and scheduler.disagg_decode_prealloc_queue is not None
