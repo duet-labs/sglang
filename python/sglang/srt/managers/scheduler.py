@@ -5266,10 +5266,9 @@ class Scheduler(
         if request_queries.is_idle_for_flush(self):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            # Empty when idle, except a pipeline ring; this resets
-            # last_launched with last_batch. The ring keeps its records,
-            # empty ones included: every rank's relay reads them at the same
-            # positions.
+            # The queue is empty when idle; draining resets last_launched
+            # with last_batch. A pipeline ring keeps its records (None or
+            # empty when idle): each rank's relay reads them by slot.
             if not self.inflight_steps.ring:
                 self.inflight_steps.drain()
             self.tree_cache.reset()
