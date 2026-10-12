@@ -4391,7 +4391,6 @@ class Scheduler(
             return False
 
         if not retract:
-            # Hold mode never retracts; rows that do not fit decode on a later step.
             if kv_full_retract_flag:
                 return False
             if finishing_reqs:
