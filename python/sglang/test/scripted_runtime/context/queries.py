@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
 
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -15,7 +16,11 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
         yield s.chunked_req
     yield from s.waiting_queue
     if get_parallel().pp_size > 1:
-        for mb in (*s.inflight_steps.slot_batches(), *s.last_mbs, *s.running_mbs):
+        for mb in (
+            *request_queries.get_pp_batches(s),
+            *s.last_mbs,
+            *s.running_mbs,
+        ):
             if mb is not None:
                 yield from mb.reqs
     else:

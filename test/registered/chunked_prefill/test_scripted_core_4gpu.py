@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.managers.scheduler_components import request_queries
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -72,7 +73,7 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             in_flight = any(
                 mb is not None and not mb.is_empty()
-                for mb in scheduler.inflight_steps.slot_batches()
+                for mb in request_queries.get_pp_batches(scheduler)
             )
             queues_clear = (
                 scheduler.chunked_req is None
