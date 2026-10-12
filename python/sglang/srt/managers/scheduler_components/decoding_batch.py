@@ -9,8 +9,9 @@ stays valid across them.
 
 Under get_next_batch_to_run the rows are never a step: a decode step is a copy
 of the rows (``decode_step``), and the rows take back the fields its run and
-commit rebound (``absorb``) before the next plan reads them. PD decode and
-pdmux still launch the rows themselves.
+commit rebound (``absorb``) before the next plan reads them. The PD decode
+normal and overlap loops launch such a copy too, and take it back at launch.
+The pipeline PD decode loop and pdmux still launch the rows themselves.
 
 The normal and overlap loops change the rows at launch and commit: right after
 a step's run the rows absorb it and the rows whose last prefill chunk it ran
