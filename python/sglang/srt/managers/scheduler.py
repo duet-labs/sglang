@@ -235,6 +235,7 @@ from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
 )
+from sglang.srt.managers.scheduler_components.inflight_queue import InflightQueue
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
@@ -1293,6 +1294,9 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # Launched batches whose results are not committed yet. Each event loop
+        # installs its own on entry.
+        self.inflight_steps = InflightQueue(depth=0)
         self.result_queue: deque[
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
@@ -1937,6 +1941,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        self.inflight_steps = InflightQueue(depth=0)
         while True:
             if self.gracefully_exit:
                 break
@@ -1958,7 +1963,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                self.inflight_steps.push(batch, result)
+                self._commit_due_step()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -1966,6 +1972,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            self.inflight_steps.end_step(batch)
+            self._debug_check_last_launched()
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -2044,6 +2052,14 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _commit_due_step(self) -> None:
+        record = self.inflight_steps.pop_due()
+        self.process_batch_result(record.batch, record.result)
+
+    def _debug_check_last_launched(self) -> None:
+        if envs.SGLANG_DEBUG_REQUEST_MEMBERSHIP.get():
+            assert self.inflight_steps.last_launched is self.last_batch
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
