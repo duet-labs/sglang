@@ -322,7 +322,6 @@ def has_active_sampling_mask_req(scheduler: Scheduler) -> bool:
     if get_inflight_steps(scheduler).ring:
         batches.extend(get_pp_running_batches(scheduler))
         batches.extend(get_pp_batches(scheduler))
-        batches.extend(scheduler.last_mbs)
     queued = [
         *(req for batch in batches if batch is not None for req in batch.reqs),
         *get_waiting_queue(scheduler),

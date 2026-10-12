@@ -18,7 +18,6 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     if get_parallel().pp_size > 1:
         for mb in (
             *request_queries.get_pp_batches(s),
-            *s.last_mbs,
             *s.running_mbs,
         ):
             if mb is not None:

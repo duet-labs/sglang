@@ -130,7 +130,7 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.decoding_batch = self.decoding_batches[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                self.last_batch = self._pp_slot_last_batch(mb_id)
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -202,7 +202,6 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self._pp_update_rows_at_commit(next_mb_id, next_batch)
-                    self.last_mbs[next_mb_id] = next_batch
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
@@ -261,7 +260,7 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.decoding_batch = self.decoding_batches[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                self.last_batch = self._pp_slot_last_batch(mb_id)
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -339,7 +338,6 @@ class SchedulerPPMixin:
                         next_batch,
                         next_batch_result,
                     )
-                    self.last_mbs[next_mb_id] = next_batch
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -385,7 +383,7 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.decoding_batch = self.decoding_batches[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                self.last_batch = self._pp_slot_last_batch(mb_id)
                 next_first_rank_mb_id = (
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
@@ -516,7 +514,6 @@ class SchedulerPPMixin:
                         next_batch_result,
                     )
                     self._pp_update_rows_at_commit(next_mb_id, next_batch)
-                    self.last_mbs[next_mb_id] = next_batch
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -567,6 +564,11 @@ class SchedulerPPMixin:
     def running_mbs(self: Scheduler, rows_per_slot: List[ScheduleBatch]) -> None:
         self.decoding_batches = [DecodingBatch(rows) for rows in rows_per_slot]
 
+    def _pp_slot_last_batch(self: Scheduler, mb_id: int) -> Optional[ScheduleBatch]:
+        """The step slot mb_id launched last, which the ring committed in the
+        step before; None when that step launched nothing."""
+        return self.inflight_steps.slot_batches()[mb_id]
+
     def _pp_update_rows_at_commit(
         self: Scheduler, mb_id: int, batch: ScheduleBatch
     ) -> None:
@@ -595,7 +597,6 @@ class SchedulerPPMixin:
         # One record per ring step; slot mb_id commits L - 1 steps after its
         # launch, just before the step that replans it.
         self.inflight_steps = InflightQueue(depth=self.pp_loop_size - 1, ring=True)
-        self.last_mbs = [None] * self.pp_loop_size
         self.decoding_batches = [
             DecodingBatch(ScheduleBatch(reqs=[])) for _ in range(self.pp_loop_size)
         ]
