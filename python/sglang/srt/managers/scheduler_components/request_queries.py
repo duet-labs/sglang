@@ -9,7 +9,7 @@ take the live ``Scheduler`` and only read it.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Deque, List, Optional, Set
+from typing import TYPE_CHECKING, Deque, List, Optional, Set, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_memory, get_parallel
@@ -232,9 +232,10 @@ def weight_version_reqs(scheduler: Scheduler) -> Set[Req]:
     return live_reqs
 
 
-def retract_on_pause_reqs(scheduler: Scheduler) -> List[Req]:
-    """The requests a retract-mode pause retracts, in retraction order. The
-    caller drains pending results first and removes these from their holders."""
+def retract_on_pause_reqs(scheduler: Scheduler) -> Tuple[List[Req], List[Req]]:
+    """The requests a retract-mode pause retracts, in retraction order, and the
+    waiting requests among them. The caller drains pending results first and
+    removes these from their holders."""
     running_batch = get_running_batch(scheduler)
     last_batch = get_last_batch(scheduler)
     chunked_req = get_chunked_req(scheduler)
@@ -261,11 +262,13 @@ def retract_on_pause_reqs(scheduler: Scheduler) -> List[Req]:
     ):
         retract_reqs.append(chunked_req)
 
+    staged = []
     if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
         # Transferred requests wait for a slot holding their row and KV;
         # retract them too, so their KV is rebuilt under the new weights.
-        retract_reqs += [r for r in get_waiting_queue(scheduler) if r.kv.holds_kv]
-    return retract_reqs
+        staged = [r for r in get_waiting_queue(scheduler) if r.kv.holds_kv]
+        retract_reqs += staged
+    return retract_reqs, staged
 
 
 def owning_row_reqs(scheduler: Scheduler) -> List[Req]:

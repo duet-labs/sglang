@@ -5502,11 +5502,12 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
 
-        retract_reqs = request_queries.retract_on_pause_reqs(self)
-        if self.disaggregation_mode == DisaggregationMode.DECODE and any(
-            r.kv.holds_kv for r in self.waiting_queue
-        ):
-            self.waiting_queue = [r for r in self.waiting_queue if not r.kv.holds_kv]
+        retract_reqs, staged = request_queries.retract_on_pause_reqs(self)
+        if staged:
+            staged_ids = {id(r) for r in staged}
+            self.waiting_queue = [
+                r for r in self.waiting_queue if id(r) not in staged_ids
+            ]
 
         self.last_batch = None
         self.cur_batch_for_debug = None
