@@ -351,12 +351,13 @@ def has_active_sampling_mask_req(scheduler: Scheduler) -> bool:
 def assert_single_membership(scheduler: Scheduler) -> None:
     """No request is in two of the containers that hold it between iterations.
 
-    A request may be in none of them: a just-prefilled one lives only in
-    last_batch until the next merge. last_batch, inflight_steps and the PP
-    micro-batch lists index requests already counted here, and the PD
-    pending-DP-rank and dLLM staging queues are subsets of the prealloc and
-    dLLM waiting queues, so none of those is a container. Only distinct
-    containers are compared: a request listed twice in one is not flagged.
+    A request may be in none of them: under a loop that joins at the next
+    plan, a just-prefilled one lives only in last_batch until that plan.
+    last_batch, inflight_steps and the PP micro-batch lists index requests
+    already counted here, and the PD pending-DP-rank and dLLM staging queues
+    are subsets of the prealloc and dLLM waiting queues, so none of those is
+    a container. Only distinct containers are compared: a request listed
+    twice in one is not flagged.
     """
     chunked_req = get_chunked_req(scheduler)
     containers = {
