@@ -246,11 +246,10 @@ def retract_on_pause_reqs(scheduler: Scheduler) -> Tuple[List[Req], List[Req]]:
     running_batch = get_running_batch(scheduler)
     last_batch = get_last_batch(scheduler)
     chunked_req = get_chunked_req(scheduler)
-    retract_reqs = [r for r in running_batch.reqs if not r.finished()]
     if (
         last_batch is not None
-        # A step without prefill rows is the DP extend view of a decode step;
-        # its requests are the running ones, already listed above.
+        # A step without prefill rows is a decode step, or its DP extend
+        # view; its requests are the running ones.
         and last_batch.has_prefill_rows()
         # Skip merge for disagg prefill: completed prefill requests are
         # already in disagg_prefill_inflight_queue. Merging them into
@@ -258,7 +257,17 @@ def retract_on_pause_reqs(scheduler: Scheduler) -> Tuple[List[Req], List[Req]]:
         # calls update_running_batch to clean them up.
         and scheduler.disaggregation_mode != DisaggregationMode.PREFILL
     ):
-        retract_reqs += [r for r in last_batch.reqs if not r.finished()]
+        launched_reqs = last_batch.reqs
+    else:
+        launched_reqs = []
+    # The rows the last step did not launch, then that step's rows in its
+    # order, where a mid-chunk request sits where admission put it. Running
+    # rows that already joined from that step are listed once, at its order.
+    launched_ids = {id(r) for r in launched_reqs}
+    retract_reqs = [
+        r for r in running_batch.reqs if not r.finished() and id(r) not in launched_ids
+    ]
+    retract_reqs += [r for r in launched_reqs if not r.finished()]
 
     if (
         chunked_req is not None
