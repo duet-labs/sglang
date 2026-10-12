@@ -107,8 +107,9 @@ class SchedulingTraceWriter:
         """Snapshot the readers' values for the next schedule record.
 
         Called at the top of each scheduler iteration. Not asked from
-        record_schedule: during planning, scheduler.running_batch is not yet
-        the plan's running batch, a state no reader sees. A paused iteration
+        record_schedule: readers run between plans, and by the time a plan is
+        recorded it has already changed what they read (the running rows,
+        last_batch), a state no reader sees. A paused iteration
         skips planning, so its values are written as a ``paused`` record.
         """
         load = scheduler.load_inquirer.get_loads()
