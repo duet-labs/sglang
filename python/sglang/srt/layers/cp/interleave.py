@@ -28,6 +28,7 @@ After all-gather, tokens are restored to the original order:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -36,6 +37,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -48,6 +50,8 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,7 +70,24 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
-        return seq_len > 0 and seq_len >= cp_size and cp_size > 1
+        if not (seq_len > 0 and seq_len >= cp_size and cp_size > 1):
+            return False
+        from sglang.srt.layers.attention.dsa.utils import (
+            dsa_prefill_cp_skip_short_extend,
+        )
+
+        if dsa_prefill_cp_skip_short_extend(forward_batch):
+            if not getattr(self, "_logged_short_extend_tp_only", False):
+                self._logged_short_extend_tp_only = True
+                logger.info(
+                    "DSA prefill CP: extend batch with %d new tokens <= "
+                    "SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS=%d runs TP-only "
+                    "(no CP sharding)",
+                    seq_len,
+                    envs.SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS.get(),
+                )
+            return False
+        return True
 
     def build_metadata(
         self,
