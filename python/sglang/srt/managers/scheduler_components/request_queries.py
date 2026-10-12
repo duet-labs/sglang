@@ -43,15 +43,11 @@ def get_result_queue(scheduler: Scheduler) -> Deque:
 
 def get_pp_running_batches(scheduler: Scheduler) -> List[ScheduleBatch]:
     # Set up by the pipeline-parallel event loops only.
-    return getattr(scheduler, "running_mbs", ())
+    return scheduler.running_mbs
 
 
 def get_pp_batches(scheduler: Scheduler) -> List[Optional[ScheduleBatch]]:
-    return getattr(scheduler, "mbs", ())
-
-
-def get_pp_last_batches(scheduler: Scheduler) -> List[Optional[ScheduleBatch]]:
-    return getattr(scheduler, "last_mbs", ())
+    return scheduler.mbs
 
 
 def get_grammar_queue(scheduler: Scheduler) -> List[Req]:
@@ -301,9 +297,10 @@ def sampling_mask_reqs(scheduler: Scheduler) -> List[Req]:
     """The queued or running requests, including PP micro-batches and PD decode
     queues, that a sampling-mask setting change must account for."""
     batches = [get_running_batch(scheduler), get_last_batch(scheduler)]
-    batches.extend(get_pp_running_batches(scheduler))
-    batches.extend(get_pp_batches(scheduler))
-    batches.extend(get_pp_last_batches(scheduler))
+    # Read without the PP accessors: a non-PP scheduler has no micro-batches.
+    batches.extend(getattr(scheduler, "running_mbs", ()))
+    batches.extend(getattr(scheduler, "mbs", ()))
+    batches.extend(getattr(scheduler, "last_mbs", ()))
     queued = [
         *(req for batch in batches if batch is not None for req in batch.reqs),
         *get_waiting_queue(scheduler),
