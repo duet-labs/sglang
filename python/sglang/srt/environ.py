@@ -1737,6 +1737,10 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    # Prefill-CP hybrid: extend batches with at most this many new tokens skip
+    # CP sharding and run TP-only (no per-layer CP all-gather/reduce-scatter).
+    # 0 keeps the existing behaviour (CP for every extend batch >= cp_size tokens).
+    SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS = EnvInt(0)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
