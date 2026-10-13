@@ -186,7 +186,12 @@ def handle_model_specific_adjustments(server_args: Any):
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
             ):  # CUDA or ROCm GPU
-                if cfg.enable_prefill_cp:
+                prefill_graph = cfg.cuda_graph_config.prefill
+                min_extend = envs.SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS.get()
+                if cfg.enable_prefill_cp and (
+                    min_extend <= 0
+                    or prefill_graph.backend not in (Backend.BREAKABLE, Backend.FULL)
+                ):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
@@ -197,6 +202,36 @@ def handle_model_specific_adjustments(server_args: Any):
                             cfg.cuda_graph_config,
                             Phase.PREFILL,
                             backend=Backend.DISABLED,
+                        ),
+                    )
+                elif cfg.enable_prefill_cp:
+                    # Prefill-CP hybrid: extends <= min_extend run TP-only and
+                    # may replay a prefill graph; CP-sharded batches stay eager
+                    # (PrefillCudaGraphRunner.can_run_graph). Capture buckets
+                    # are clamped so no captured shape takes the CP path.
+                    from sglang.srt.arg_groups.cuda_graph_hook import (
+                        generate_prefill_cuda_graph_batch_sizes,
+                    )
+
+                    bs = [b for b in (prefill_graph.bs or []) if b <= min_extend]
+                    if not bs:
+                        bs = generate_prefill_cuda_graph_batch_sizes(min_extend)
+                    logger.info(
+                        "DSA prefill CP: keeping %s prefill CUDA graph for TP-only "
+                        "extends <= SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS=%d; "
+                        "CP-sharded batches run eager; capture buckets=%s",
+                        prefill_graph.backend,
+                        min_extend,
+                        bs,
+                    )
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.PREFILL,
+                            bs=bs,
+                            max_bs=bs[-1],
                         ),
                     )
                 else:

@@ -1470,6 +1470,10 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
         2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
     )
+    # Prefill-CP hybrid: extend batches with at most this many new tokens skip
+    # CP sharding and run TP-only (no per-layer CP all-gather/reduce-scatter).
+    # 0 keeps the existing behaviour (CP for every extend batch >= cp_size tokens).
+    SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS = EnvInt(0)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
