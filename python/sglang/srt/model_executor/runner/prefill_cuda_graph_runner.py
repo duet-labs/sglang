@@ -42,7 +42,7 @@ import dataclasses
 import inspect
 import logging
 from collections.abc import Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -54,7 +54,11 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_prefill_cp_batch_is_tp_only,
+    dsa_prefill_cp_tp_only_graph_enabled,
+    is_dsa_enable_prefill_cp,
+)
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
@@ -1383,6 +1387,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
+        # Prefill-CP hybrid: the graph was captured without CP, so only a
+        # batch every CP gate leaves TP-only may replay it.
+        if (
+            is_dsa_enable_prefill_cp()
+            and dsa_prefill_cp_tp_only_graph_enabled()
+            and not dsa_prefill_cp_batch_is_tp_only(forward_batch)
+        ):
+            return False
+
         # Non-DP local check (sole decision for tp-only).
         batch_max_context_len = (
             self._batch_max_context_len(forward_batch)
@@ -2087,6 +2100,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             output, self.layer_model.last_hc_hidden_states = output
         return output
 
+    @contextmanager
+    def _dsa_prefill_cp_tp_only_attn_ctx(self, static_forward_batch: ForwardBatch):
+        """Prefill-CP hybrid: a TP-only extend runs attention under the CP
+        decode-attn-TP context (sliced heads), which the eager decoder layer
+        enters per layer. Graph replay bypasses the layer forward, so enter the
+        same context here or the eager break ops (split attention) see the
+        all-heads tp_q_head_num while the captured q holds the sliced heads."""
+        layers = getattr(self.layer_model, "layers", None)
+        if not (
+            is_dsa_enable_prefill_cp()
+            and dsa_prefill_cp_tp_only_graph_enabled()
+            and layers is not None
+        ):
+            yield
+            return
+        with ExitStack() as stack:
+            for layer in layers:
+                attn = getattr(layer, "self_attn", None)
+                ctx = getattr(attn, "maybe_use_decode_attn_tp", None)
+                if ctx is not None:
+                    stack.enter_context(ctx(static_forward_batch))
+            yield
+
     def _execute_body_capture(
         self,
         forward_batch: ForwardBatch,
@@ -2116,7 +2152,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self.buffer_registry.has_slot("input_embeds")
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
-            hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            with self._dsa_prefill_cp_tp_only_attn_ctx(static_forward_batch):
+                hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
@@ -2245,6 +2282,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
+            if dsa_prefill_cp_tp_only_graph_enabled():
+                logger.info(
+                    "prefill BCG replay bucket=%d tokens=%d",
+                    static_num_tokens,
+                    raw_num_tokens,
+                )
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:

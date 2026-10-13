@@ -592,6 +592,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental. With <code>--enable-prefill-cp --cp-strategy interleave</code> on a DSA model, extend batches with at most this many new tokens skip CP sharding and run TP-only; when a breakable or full prefill CUDA graph is configured, those TP-only batches replay it (capture buckets are clamped to this value) while CP-sharded batches stay eager. <code>0</code> disables the hybrid. Must be set identically on all ranks.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_BROADCAST</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental. When enabled, broadcast the finalized NSA/DSA indexer top-k result from attention TP rank 0 to the other attention TP ranks. This can mitigate top-k mismatches in TP attention runs at the cost of some speed.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

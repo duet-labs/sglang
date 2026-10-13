@@ -74,7 +74,11 @@ from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_prefill_cp_batch_is_tp_only,
+    dsa_prefill_cp_tp_only_graph_enabled,
+    is_dsa_enable_prefill_cp,
+)
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_active,
@@ -274,11 +278,17 @@ class SamplingPrewarmResult:
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
-    """Allow CP only through a runner that captured the validated CP body."""
-    return get_cp_strategy() is None or (
-        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
-        and is_cp_active(forward_batch)
-    )
+    """Allow CP only through a runner that captured the validated CP body.
+    Under the prefill-CP hybrid a TP-only (unsharded) batch may also replay."""
+    if get_cp_strategy() is None:
+        return True
+    if dsa_prefill_cp_tp_only_graph_enabled() and dsa_prefill_cp_batch_is_tp_only(
+        forward_batch
+    ):
+        return True
+    return bool(
+        getattr(prefill_runner, "enable_cp_bcg_capture", False)
+    ) and is_cp_active(forward_batch)
 
 
 @dataclass

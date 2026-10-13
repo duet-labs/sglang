@@ -226,8 +226,44 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     )
 
 
+def dsa_prefill_cp_skip_short_extend(forward_batch: "ForwardBatch") -> bool:
+    """Prefill-CP hybrid: True when this extend batch is short enough to run
+    TP-only. Every per-batch CP gate (the CP strategy's ``can_apply`` and the
+    DSA attention-metadata sharding/padding) must consult this so a batch is
+    either fully sharded or fully unsharded."""
+    min_extend_tokens = envs.SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS.get()
+    if min_extend_tokens <= 0:
+        return False
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if extend_lens is None:
+        return False
+    return 0 < sum(extend_lens) <= min_extend_tokens
+
+
+def dsa_prefill_cp_tp_only_graph_enabled() -> bool:
+    """Prefill-CP hybrid is on: TP-only short extends may replay a prefill
+    CUDA graph while CP-sharded batches stay eager."""
+    return envs.SGLANG_DSA_PREFILL_CP_MIN_EXTEND_TOKENS.get() > 0
+
+
+def dsa_prefill_cp_batch_is_tp_only(forward_batch: "ForwardBatch") -> bool:
+    """True only when every CP gate leaves this extend batch unsharded, so a
+    prefill CUDA graph captured without CP can replay it. Never a mixed
+    decision: the same helper drives the CP strategy's ``can_apply`` and the
+    DSA metadata sharding."""
+    from sglang.srt.layers.cp.utils import is_cp_active
+
+    return (
+        dsa_prefill_cp_skip_short_extend(forward_batch)
+        and not is_cp_active(forward_batch)
+        and forward_batch.attn_cp_metadata is None
+    )
+
+
 def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
+        return False
+    if dsa_prefill_cp_skip_short_extend(forward_batch):
         return False
     cp_size = get_parallel().attn_cp_size
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
