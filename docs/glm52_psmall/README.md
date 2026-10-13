@@ -7,11 +7,15 @@ It is **not** an upstream candidate as-is; see "Known gaps".
 ## What it does
 
 In the validated prod recipe (`--enable-prefill-cp --attn-cp-size 4
---cp-strategy interleave`, EAGLE 5/1/6) roughly 85% of prefill steps are short
-cached extends: ~200-450 new tokens appended to a 10-14k-token cached prefix.
-Prefill-CP shards such a batch across the 4 ranks exactly like a cold prefill,
-and the step becomes launch-paced (~3.6k kernel launches; host CPU ~253 ms vs
-GPU busy ~137 ms per step).
+--cp-strategy interleave`, EAGLE 5/1/6) at production cache-hit rates
+(~0.57-0.66) only ~14% of prefill steps are short extends of <= 2048 new tokens
+(ladder c=1: 186/1350 rank-0 prefill steps; all 186 replayed a graph, 0 of the
+1164 CP-sharded steps did). ~85% of steps are long (> 2048 new tokens)
+CP-sharded prefills, which this patch leaves unchanged. Short extends dominate
+only in hot-prefix traffic (hit ~0.98): ~200-450 new tokens appended to a
+10-14k-token cached prefix. Prefill-CP shards such a short batch across the 4
+ranks exactly like a cold prefill, and the step becomes launch-paced (~3.6k
+kernel launches; host CPU ~253 ms vs GPU busy ~137 ms per short step).
 
 The patch adds two mechanisms, both off by default:
 
@@ -124,12 +128,23 @@ prefill BCG replay bucket=<B> tokens=<N>
 
 | Metric | Baseline (v0.5.19) | Patched |
 |---|---|---|
-| c=1 first token, hot 10-14k prefix | 177 ms | 72 ms |
+| c=1 first token, hot 10-14k prefix (hit ~0.98) | 177 ms | 72 ms |
 | Prefill-step p50, extends <= 2048 new tokens | - | -13% to -20% |
 | Long cold prefills | unchanged | unchanged |
 | Loaded p95 | unchanged | unchanged |
 | EAGLE acceptance length | 4.61 | 4.56 |
 | CUDA / NCCL faults over >6k requests | 0 | 0 |
+
+Matched cache-hit rate (staging, engine-side, B200 x4, dense prod corpus):
+
+| Run | Metric | Baseline (v0.5.19) | Patched | Delta |
+|---|---|---|---|---|
+| c=1, hit 0.571 | TTFT p50 / p95 | 182 / 405 ms | 183 / 402 ms | +-0 |
+| c=1, hit 0.571 | E2E p95 | 962 ms | 916 ms | -5% |
+| c=1, hit 0.571 | rps | - | - | +5% |
+| c=2, hit 0.571 | TTFT p50 / p95 | 511 / 843 ms | 386 / 754 ms | -25% / -11% |
+| c=2, hit 0.571 | E2E p95 | 1457 ms | 1425 ms | -2% |
+| c=2, hit 0.571 | rps | - | - | +9% |
 
 Output parity: `finish_reason`, `cached_tokens`, `tool_calls` and SSE structure
 exact (40/40 paired requests); reasoning text differs within the
@@ -144,7 +159,8 @@ control-vs-control nondeterminism band (NVFP4 MoE + EAGLE).
 - Targets v0.5.19 only. It does **not** apply to current `main`: 7 of 8 files
   conflict, the CP-v1 gates were removed upstream and `main` has two CP gates,
   not three.
-- Threshold 2048 covers ~85% of our prefill steps; it was not swept.
+- Threshold 2048 covers only ~14% of prefill steps at production cache-hit
+  rates (~85% are long CP-sharded prefills, unchanged); it was not swept.
 - Graph memory cost (buckets up to 2048 tokens) was not measured in MB; no OOM
   at `--mem-fraction-static 0.85`.
 
@@ -156,10 +172,10 @@ control-vs-control nondeterminism band (NVFP4 MoE + EAGLE).
 | 2 | Model quality changed? | Same weights/KV/sampling; only partitioning + graph replay change. Accept len 4.56 vs 4.61. No formal eval run. | partially open |
 | 3 | Why safe when B2 crashed? | B2 flipped 2 of 3 CP gates -> DSA metadata sized for 1/4 tokens, OOB writes. B3 flips all 3 together; 0 CUDA/NCCL faults over >6k requests incl. forced cold-CP->short-extend transitions. | answered |
 | 4 | Why does upstream disable this? | PR #23351 (PCG only when not CP), PR #29458 (CP all_gather replay size mismatch). Neither applies to fully TP-only batches; CP-sharded batches stay eager here. | answered |
-| 5 | Other models/shapes? | Not DSA-gated (would flip other interleave-CP DSA/MLA models); rank-local decision -> unsafe with DP-attention + CP. Long-cold/RAG: no effect; high batch: benefit fades. | open |
+| 5 | Other models/shapes? | Not DSA-gated (would flip other interleave-CP DSA/MLA models); rank-local decision -> unsafe with DP-attention + CP. Long-cold/RAG: no effect (and at prod hit ~0.57-0.66 that is ~85% of steps); high batch: benefit fades. | open |
 | 6 | EAGLE interaction? | Draft/verify untouched; acceptance unchanged; prefill graphs capture target model only. | answered |
 | 7 | Kill switch? | Env unset / flag off = byte-identical engine. | answered |
-| 8 | What it buys? | c=1 first token 177->72 ms hot prefix; short-extend prefill step -13...-20%; long cold prefills and loaded p95 unchanged. | answered |
+| 8 | What it buys? | c=1 first token 177->72 ms on hot prefix (hit ~0.98); short-extend prefill step -13...-20%; at matched prod hit 0.571: c=1 TTFT +-0, E2E p95 -5%, rps +5%; c=2 TTFT p50/p95 -25%/-11%, E2E p95 -2%, rps +9%; long cold prefills unchanged. | answered |
 | 9 | Graph memory cost? | Buckets up to 2048 tokens; no OOM at mem 0.85; exact MB not recorded. | partially open |
 | 10 | Applies to main? | No - 7/8 files conflict; main has 2 CP gates. v0.5.19 only. | answered |
-| 11 | Threshold 2048? | Covers ~85% of our prefill steps; not swept. | open |
+| 11 | Threshold 2048? | Covers ~14% of prefill steps at prod cache-hit rates (186/1350 in the c=1 ladder; ~85% of steps are long CP-sharded prefills); not swept. | open |
