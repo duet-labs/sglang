@@ -328,7 +328,7 @@ def moe_finalize_all_reduce_mhc_quant(
     ``(reduced, mhc_out, normalized, quantized, scales)``.
     """
     rows = weights.shape[0]
-    assert 0 < rows <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get()
+    assert 0 < rows <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get()
     out = torch.empty(
         (rows, _MHC_HIDDEN_DIM), dtype=torch.bfloat16, device=gemm2.device
     )

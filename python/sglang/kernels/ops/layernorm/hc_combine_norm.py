@@ -134,7 +134,7 @@ def hc_combine_norm_mxfp8(
 ):
     """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
     m = x.shape[0]
-    assert 0 < m <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get(), "the fused MXFP8 epilogue only supports small decode/verify"
+    assert 0 < m <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get(), "the fused MXFP8 epilogue only supports small decode/verify"
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
     q, s = _alloc(m, k, x.device)

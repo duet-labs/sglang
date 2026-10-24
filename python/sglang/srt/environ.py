@@ -1535,10 +1535,11 @@ class Envs:
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
-    # Token cap for the small-batch fused decode/verify fast paths (fused mHC
-    # pre/post + all-reduce, wo_a small-batch, fused q-norm/rope, swap-AB attention).
-    # 8 = current behavior; 16 lets DSpark verify-16 keep the fused paths.
-    SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS = EnvInt(8)
+    # Row cap (tokens incl. the root token, i.e. speculative_num_draft_tokens
+    # x batch) for the small-batch fused decode/verify fast paths (fused mHC
+    # pre/post + all-reduce, wo_a small-batch, fused q-norm/rope, swap-AB
+    # attention). 8 = current behavior; DSpark verify-16 is 17 rows per request.
+    SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS = EnvInt(8)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

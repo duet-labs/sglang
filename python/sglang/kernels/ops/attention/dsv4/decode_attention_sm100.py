@@ -11,11 +11,11 @@ from .kv_layout import KVLayout
 from sglang.srt.environ import envs
 
 LAYOUT = KVLayout.V4
-MAX_BATCH = 8  # default; raised by SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS
+MAX_BATCH = 8  # default; raised by SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS
 
 
 def _max_batch() -> int:
-    return max(MAX_BATCH, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get())
+    return max(MAX_BATCH, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get())
 NUM_HEADS = 16
 HEAD_DIM = 512
 SOFTMAX_SCALE = HEAD_DIM**-0.5
