@@ -224,6 +224,24 @@ def _small_verify_max_rows() -> int:
     return envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get()
 
 
+_logged_small_verify_rows: set = set()
+
+
+def _log_small_verify_paths_once(rows: int) -> None:
+    if rows in _logged_small_verify_rows:
+        return
+    _logged_small_verify_rows.add(rows)
+    cap = _small_verify_max_rows()
+    logger.info(
+        "dsv4 small-verify paths for %d rows (cap %d): fused_small=%s wo_a_small_batch=%s fused_finalize_quant=%s",
+        rows,
+        cap,
+        rows <= cap,
+        2 <= rows <= _wo_a_small_batch_max_rows(),
+        rows <= _fused_finalize_quant_max_rows(),
+    )
+
+
 
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
@@ -511,6 +529,7 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
+        _log_small_verify_paths_once(o.shape[0])
         if 2 <= o.shape[0] <= _wo_a_small_batch_max_rows():
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
