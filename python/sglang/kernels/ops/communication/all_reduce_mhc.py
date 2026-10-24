@@ -16,6 +16,7 @@ from sglang.kernels.ops.communication.all_reduce_fusion import (
     require_cluster_launch_arch,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.environ import envs
 
 # The kernel is built for this width only (static_assert in all_reduce_fusion.cuh).
 _MHC_HIDDEN_DIM = 5120
@@ -327,7 +328,7 @@ def moe_finalize_all_reduce_mhc_quant(
     ``(reduced, mhc_out, normalized, quantized, scales)``.
     """
     rows = weights.shape[0]
-    assert 0 < rows <= 8
+    assert 0 < rows <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get()
     out = torch.empty(
         (rows, _MHC_HIDDEN_DIM), dtype=torch.bfloat16, device=gemm2.device
     )

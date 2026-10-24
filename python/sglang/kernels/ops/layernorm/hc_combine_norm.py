@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.layernorm.mxfp8_epilogue import mxfp8_epilogue
+from sglang.srt.environ import envs
 
 
 @triton.jit
@@ -133,7 +134,7 @@ def hc_combine_norm_mxfp8(
 ):
     """Four-stream combine + RMSNorm returning ``(y_bf16, y_q, y_sf)``."""
     m = x.shape[0]
-    assert 0 < m <= 8, "the fused MXFP8 epilogue only supports small decode/verify"
+    assert 0 < m <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get(), "the fused MXFP8 epilogue only supports small decode/verify"
     k = x.shape[1] // 4
     y = torch.empty((m, k), dtype=x.dtype, device=x.device)
     q, s = _alloc(m, k, x.device)

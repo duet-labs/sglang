@@ -206,6 +206,11 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 if _is_npu:
     import torch_npu
 
+def _small_verify_max_tokens() -> int:
+    """Token cap for the small-batch fused decode/verify paths (default 8)."""
+    return envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get()
+
+
 
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
@@ -493,7 +498,7 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= 8:
+        if 2 <= o.shape[0] <= _small_verify_max_tokens():
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
@@ -1263,7 +1268,7 @@ class MQALayer(MqaAttentionBase):
             and get_platform().is_blackwell
             and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
             and q.ndim == 2
-            and 0 < q.shape[0] <= 8
+            and 0 < q.shape[0] <= _small_verify_max_tokens()
             and q.shape[1] == 1280
             and q.stride(1) == 1
             and getattr(method, "mxfp8_dense_backend", None)
@@ -1313,7 +1318,7 @@ class MQALayer(MqaAttentionBase):
                 _is_cuda
                 and q_out is not None
                 and (
-                    0 < q.shape[0] <= 8
+                    0 < q.shape[0] <= _small_verify_max_tokens()
                     or (
                         self.is_dsv41
                         and get_platform().is_blackwell
@@ -3204,7 +3209,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         quantize = quantized is not None
         x_flat = x.flatten(1)
-        tiny = 0 < x.shape[0] <= 8
+        tiny = 0 < x.shape[0] <= _small_verify_max_tokens()
         if stats_stream is not None and not tiny:
             stats_stream.wait_stream(torch.cuda.current_stream())
 
@@ -3254,7 +3259,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and not is_batch_invariant_mode_enabled()
             ):
                 # The fused scale writer supports the small decode/verify tile only.
-                if quantize and x.shape[0] <= 8:
+                if quantize and x.shape[0] <= _small_verify_max_tokens():
                     from sglang.kernels.ops.layernorm.hc_combine_norm import (
                         hc_combine_norm_mxfp8,
                     )
@@ -3563,7 +3568,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.config.model_type == "deepseek_v41"
             and x.is_cuda
             and get_platform().is_blackwell
-            and (0 < x.shape[0] <= 8 or medium_verify)
+            and (0 < x.shape[0] <= _small_verify_max_tokens() or medium_verify)
             and x.shape[1] == 5120
             and self.hc_mult == 4
             and x.dtype == residual.dtype == torch.bfloat16
@@ -3674,7 +3679,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.config.model_type == "deepseek_v41"
             and x.is_cuda
             and get_platform().is_blackwell
-            and (0 < x.shape[0] <= 8 or (medium_verify and next_combined is not None))
+            and (0 < x.shape[0] <= _small_verify_max_tokens() or (medium_verify and next_combined is not None))
             and x.shape[1] == 5120
             and self.hc_mult == 4
             and x.dtype == residual.dtype == torch.bfloat16
@@ -4504,7 +4509,7 @@ class DeepseekV4Model(nn.Module):
                 and tail is None
                 and hidden_states.is_cuda
                 and get_platform().is_blackwell
-                and 0 < hidden_states.shape[0] <= 8
+                and 0 < hidden_states.shape[0] <= _small_verify_max_tokens()
                 and (
                     forward_batch.forward_mode.is_decode()
                     or forward_batch.forward_mode.is_target_verify()

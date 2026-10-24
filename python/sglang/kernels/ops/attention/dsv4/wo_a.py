@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, cuda_stubs_dir, load_jit
 from sglang.kernels.ops.layernorm.mxfp8_epilogue import ue8m0_scale
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -126,7 +127,7 @@ def wo_a_bf16_small_batch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
     """Compute ``einsum('tgd,grd->tgr', x, weight)`` for the TP4 WO-A shape.
     Partial sums stay in FP32 until the final BF16, token-major store."""
     m = x.shape[0]
-    assert 2 <= m <= 8 and x.shape[1:] == (2, 4096)
+    assert 2 <= m <= min(16, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get()) and x.shape[1:] == (2, 4096)
     assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16
     assert x.is_cuda and x.device == weight.device
@@ -172,7 +173,7 @@ def _quantize_partial(p):
 def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
     """WO-A with BF16 rounding followed by FlashInfer-compatible MXFP8 quantization."""
     m = x.shape[0]
-    assert 2 <= m <= 8 and x.shape[1:] == (2, 4096)
+    assert 2 <= m <= min(16, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_TOKENS.get()) and x.shape[1:] == (2, 4096)
     assert x.dtype == weight.dtype == torch.bfloat16
     assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
     assert x.is_cuda and x.device == weight.device
