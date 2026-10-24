@@ -213,10 +213,15 @@ def _wo_a_small_batch_max_rows() -> int:
 
 
 def _fused_finalize_quant_max_rows() -> int:
-    """Rows the fused MoE finalize + all-reduce + next-norm quant epilogue takes
-    (hard 8 in all_reduce_fusion.cuh); larger small-verify batches keep the
-    unfused all-reduce + hc-post + rmsnorm + quantize path."""
-    return 8
+    """Rows the fused MoE finalize + all-reduce + next-norm quant epilogue takes:
+    the small-verify row cap (default 8 = previous behavior), bounded by the
+    kernel's 128-row scale tile; larger batches keep the unfused all-reduce +
+    hc-post + rmsnorm + quantize path."""
+    from sglang.kernels.ops.communication.all_reduce_mhc import (
+        MOE_FINALIZE_QUANT_MAX_ROWS,
+    )
+
+    return min(_small_verify_max_rows(), MOE_FINALIZE_QUANT_MAX_ROWS)
 
 
 def _small_verify_max_rows() -> int:

@@ -20,9 +20,10 @@ from sglang.srt.environ import envs
 
 # The kernel is built for this width only (static_assert in all_reduce_fusion.cuh).
 _MHC_HIDDEN_DIM = 5120
-# all_reduce_fusion.cuh CHECK_HOST(num_tokens <= 8) in the kQuant epilogue; the
-# small-verify row cap must not route more rows than this to the quant variant.
-MOE_FINALIZE_QUANT_MAX_ROWS = 8
+# all_reduce_fusion.cuh CHECK_HOST(num_tokens <= 128) in the kQuant epilogue: the
+# ue8m0 scale swizzle covers one 128-row tile. The model only routes rows above
+# 8 here when SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS is raised.
+MOE_FINALIZE_QUANT_MAX_ROWS = 128
 
 
 @cache_once
@@ -327,7 +328,7 @@ def moe_finalize_all_reduce_mhc_quant(
     cluster_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`moe_finalize_all_reduce_mhc_norm` plus fp8 e4m3 quantization of
-    the normalized row with ue8m0 group scales (rows <= 8). Returns
+    the normalized row with ue8m0 group scales (rows <= 128). Returns
     ``(reduced, mhc_out, normalized, quantized, scales)``.
     """
     rows = weights.shape[0]

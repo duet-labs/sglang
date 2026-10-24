@@ -131,13 +131,37 @@ def test_wo_a_small_batch_tile_is_32_rows(launches, m):
         assert small_batch_max_rows() == 8
 
 
-@pytest.mark.parametrize("m", ROWS)
-def test_fused_finalize_quant_stays_at_8_rows_regardless_of_cap(m):
-    """Rows above 8 must never reach all_reduce_fusion.cuh's kQuant CHECK_HOST."""
+def _fused_finalize_quant_rows(cap):
     from sglang.kernels.ops.communication.all_reduce_mhc import (
         MOE_FINALIZE_QUANT_MAX_ROWS,
     )
 
-    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(max(m, 17)):
-        assert MOE_FINALIZE_QUANT_MAX_ROWS == 8
-        assert not (0 < m <= MOE_FINALIZE_QUANT_MAX_ROWS)
+    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(cap):
+        return min(envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get(), MOE_FINALIZE_QUANT_MAX_ROWS)
+
+
+@pytest.mark.parametrize("m", [1, 6, 8])
+def test_fused_finalize_quant_default_cap_unchanged_at_or_below_8_rows(m):
+    """Default cap 8: rows <= 8 take the kQuant epilogue exactly as before."""
+    assert 0 < m <= _fused_finalize_quant_rows(8)
+
+
+@pytest.mark.parametrize("m", ROWS)
+def test_fused_finalize_quant_rows_above_8_need_the_flag(m):
+    """9/16/17/32 rows reach all_reduce_fusion.cuh's kQuant epilogue only when
+    SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS is raised past them (opt-in)."""
+    assert not (0 < m <= _fused_finalize_quant_rows(8))
+    assert 0 < m <= _fused_finalize_quant_rows(max(m, 17)) or m > 17
+    assert 0 < m <= _fused_finalize_quant_rows(m)
+
+
+@pytest.mark.parametrize("cap", [8, 17, 129, 1024])
+def test_fused_finalize_quant_never_exceeds_the_128_row_scale_tile(cap):
+    """The kQuant scale swizzle covers one 128-row tile (CHECK_HOST(num_tokens <= 128))."""
+    from sglang.kernels.ops.communication.all_reduce_mhc import (
+        MOE_FINALIZE_QUANT_MAX_ROWS,
+    )
+
+    assert MOE_FINALIZE_QUANT_MAX_ROWS == 128
+    assert _fused_finalize_quant_rows(cap) <= 128
+    assert not (0 < 129 <= _fused_finalize_quant_rows(cap))
