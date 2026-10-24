@@ -18,6 +18,12 @@ RANK = 1024
 N_OUT = GROUPS * RANK
 SCALE_BYTES = 8192
 MAX_M = 32
+# Row tile of the small-batch split-K path; rows above fall back to torch.bmm.
+SMALL_BATCH_MAX_ROWS = 32
+
+
+def small_batch_max_rows() -> int:
+    return min(SMALL_BATCH_MAX_ROWS, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get())
 
 
 @cache_once
@@ -97,10 +103,10 @@ def wo_a_bf16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _wo_a_partial(X, W, P, M: tl.constexpr, SX: tl.constexpr):
     tile, group, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    m = tl.arange(0, 16)
+    m = tl.arange(0, SMALL_BATCH_MAX_ROWS)
     n = tile * 64 + tl.arange(0, 64)
     k = split * 512 + tl.arange(0, 128)
-    acc = tl.zeros((16, 64), tl.float32)
+    acc = tl.zeros((SMALL_BATCH_MAX_ROWS, 64), tl.float32)
     for i in range(4):
         offsets = k + i * 128
         x = tl.load(
@@ -127,7 +133,7 @@ def wo_a_bf16_small_batch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
     """Compute ``einsum('tgd,grd->tgr', x, weight)`` for the TP4 WO-A shape.
     Partial sums stay in FP32 until the final BF16, token-major store."""
     m = x.shape[0]
-    assert 2 <= m <= min(16, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get()) and x.shape[1:] == (2, 4096)
+    assert 2 <= m <= small_batch_max_rows() and x.shape[1:] == (2, 4096)
     assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
     assert x.dtype == weight.dtype == torch.bfloat16
     assert x.is_cuda and x.device == weight.device
@@ -173,7 +179,7 @@ def _quantize_partial(p):
 def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
     """WO-A with BF16 rounding followed by FlashInfer-compatible MXFP8 quantization."""
     m = x.shape[0]
-    assert 2 <= m <= min(16, envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get()) and x.shape[1:] == (2, 4096)
+    assert 2 <= m <= small_batch_max_rows() and x.shape[1:] == (2, 4096)
     assert x.dtype == weight.dtype == torch.bfloat16
     assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
     assert x.is_cuda and x.device == weight.device

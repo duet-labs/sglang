@@ -12,7 +12,7 @@ from triton.runtime.jit import JITFunction
 
 from sglang.srt.environ import envs
 
-ROWS = (9, 16, 17)
+ROWS = (9, 16, 17, 32)
 K = 5120
 
 
@@ -60,7 +60,7 @@ def test_hc_combine_norm_mxfp8_accepts_rows_under_cap(launches, m):
     x = torch.zeros((m, 4 * K), dtype=torch.bfloat16)
     pre = torch.zeros((m, 4), dtype=torch.float32)
     w = torch.ones(K, dtype=torch.bfloat16)
-    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(17):
+    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(max(m, 17)):
         y, q, s = hc_combine_norm_mxfp8(x, pre, w, 1e-6)
     assert y.shape == (m, K) and q.shape == (m, K)
     assert s.numel() == (K // 32) * triton.cdiv(m, 128) * 128
@@ -73,7 +73,7 @@ def test_rmsnorm_mxfp8_accepts_rows_under_cap(launches, m):
 
     x = torch.zeros((m, K), dtype=torch.bfloat16)
     w = torch.ones(K, dtype=torch.bfloat16)
-    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(17):
+    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(max(m, 17)):
         y, q, s = rmsnorm_mxfp8(x, w, 1e-6)
     assert y.shape == q.shape == (m, K) and s.numel() == (K // 32) * 128
     assert launches.grids[-1][0] == m + triton.cdiv(s.numel(), 512)
@@ -106,16 +106,38 @@ class _CudaLike(torch.Tensor):
         return True
 
 
-@pytest.mark.parametrize("m", ROWS)
-def test_wo_a_small_batch_tile_is_16_rows(launches, m):
-    from sglang.kernels.ops.attention.dsv4.wo_a import wo_a_bf16_small_batch
+@pytest.mark.parametrize("m", ROWS + (33,))
+def test_wo_a_small_batch_tile_is_32_rows(launches, m):
+    from sglang.kernels.ops.attention.dsv4.wo_a import (
+        SMALL_BATCH_MAX_ROWS,
+        small_batch_max_rows,
+        wo_a_bf16_small_batch,
+        wo_a_bf16_small_batch_mxfp8,
+    )
 
     x = torch.zeros((m, 2, 4096), dtype=torch.bfloat16).as_subclass(_CudaLike)
     w = torch.zeros((2, 1024, 4096), dtype=torch.bfloat16).as_subclass(_CudaLike)
-    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(17):
-        if m > 16:
+    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(64):
+        assert small_batch_max_rows() == SMALL_BATCH_MAX_ROWS == 32
+        if m > 32:
             with pytest.raises(AssertionError):
                 wo_a_bf16_small_batch(x, w)
         else:
-            wo_a_bf16_small_batch(x, w)
+            assert wo_a_bf16_small_batch(x, w).shape == (m, 2, 1024)
             assert launches.grids[-2] == (16, 2, 8)
+            q, s = wo_a_bf16_small_batch_mxfp8(x, w)
+            assert q.shape == (m, 2048) and s.numel() == 8192
+    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(8):
+        assert small_batch_max_rows() == 8
+
+
+@pytest.mark.parametrize("m", ROWS)
+def test_fused_finalize_quant_stays_at_8_rows_regardless_of_cap(m):
+    """Rows above 8 must never reach all_reduce_fusion.cuh's kQuant CHECK_HOST."""
+    from sglang.kernels.ops.communication.all_reduce_mhc import (
+        MOE_FINALIZE_QUANT_MAX_ROWS,
+    )
+
+    with envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.override(max(m, 17)):
+        assert MOE_FINALIZE_QUANT_MAX_ROWS == 8
+        assert not (0 < m <= MOE_FINALIZE_QUANT_MAX_ROWS)

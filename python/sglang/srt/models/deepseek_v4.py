@@ -206,6 +206,19 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 if _is_npu:
     import torch_npu
 
+def _wo_a_small_batch_max_rows() -> int:
+    from sglang.kernels.ops.attention.dsv4.wo_a import small_batch_max_rows
+
+    return small_batch_max_rows()
+
+
+def _fused_finalize_quant_max_rows() -> int:
+    """Rows the fused MoE finalize + all-reduce + next-norm quant epilogue takes
+    (hard 8 in all_reduce_fusion.cuh); larger small-verify batches keep the
+    unfused all-reduce + hc-post + rmsnorm + quantize path."""
+    return 8
+
+
 def _small_verify_max_rows() -> int:
     """Row cap (tokens incl. root) for the small-batch fused decode/verify paths (default 8)."""
     return envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get()
@@ -498,7 +511,7 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= _small_verify_max_rows():
+        if 2 <= o.shape[0] <= _wo_a_small_batch_max_rows():
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
@@ -3679,7 +3692,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.config.model_type == "deepseek_v41"
             and x.is_cuda
             and get_platform().is_blackwell
-            and (0 < x.shape[0] <= _small_verify_max_rows() or (medium_verify and next_combined is not None))
+            and (0 < x.shape[0] <= _fused_finalize_quant_max_rows() or (medium_verify and next_combined is not None))
             and x.shape[1] == 5120
             and self.hc_mult == 4
             and x.dtype == residual.dtype == torch.bfloat16
@@ -4509,7 +4522,7 @@ class DeepseekV4Model(nn.Module):
                 and tail is None
                 and hidden_states.is_cuda
                 and get_platform().is_blackwell
-                and 0 < hidden_states.shape[0] <= _small_verify_max_rows()
+                and 0 < hidden_states.shape[0] <= _fused_finalize_quant_max_rows()
                 and (
                     forward_batch.forward_mode.is_decode()
                     or forward_batch.forward_mode.is_target_verify()

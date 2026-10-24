@@ -20,6 +20,9 @@ from sglang.srt.environ import envs
 
 # The kernel is built for this width only (static_assert in all_reduce_fusion.cuh).
 _MHC_HIDDEN_DIM = 5120
+# all_reduce_fusion.cuh CHECK_HOST(num_tokens <= 8) in the kQuant epilogue; the
+# small-verify row cap must not route more rows than this to the quant variant.
+MOE_FINALIZE_QUANT_MAX_ROWS = 8
 
 
 @cache_once
@@ -328,7 +331,7 @@ def moe_finalize_all_reduce_mhc_quant(
     ``(reduced, mhc_out, normalized, quantized, scales)``.
     """
     rows = weights.shape[0]
-    assert 0 < rows <= envs.SGLANG_OPT_DSV4_SMALL_VERIFY_MAX_ROWS.get()
+    assert 0 < rows <= MOE_FINALIZE_QUANT_MAX_ROWS
     out = torch.empty(
         (rows, _MHC_HIDDEN_DIM), dtype=torch.bfloat16, device=gemm2.device
     )
