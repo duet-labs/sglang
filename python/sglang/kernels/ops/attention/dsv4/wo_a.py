@@ -101,12 +101,12 @@ def wo_a_bf16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _wo_a_partial(X, W, P, M: tl.constexpr, SX: tl.constexpr):
+def _wo_a_partial(X, W, P, M: tl.constexpr, SX: tl.constexpr, ROWS: tl.constexpr):
     tile, group, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    m = tl.arange(0, SMALL_BATCH_MAX_ROWS)
+    m = tl.arange(0, ROWS)
     n = tile * 64 + tl.arange(0, 64)
     k = split * 512 + tl.arange(0, 128)
-    acc = tl.zeros((SMALL_BATCH_MAX_ROWS, 64), tl.float32)
+    acc = tl.zeros((ROWS, 64), tl.float32)
     for i in range(4):
         offsets = k + i * 128
         x = tl.load(
@@ -141,7 +141,7 @@ def wo_a_bf16_small_batch(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
     result = torch.empty((m, 2, 1024), dtype=x.dtype, device=x.device)
     partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
     _wo_a_partial[(16, 2, 8)](
-        x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
+        x, weight, partial, m, x.stride(0), SMALL_BATCH_MAX_ROWS, num_warps=4, num_stages=3
     )
     _wo_a_reduce[(triton.cdiv(m * 2048, 256),)](partial, result, m * 2048, num_warps=4)
     return result
@@ -186,6 +186,6 @@ def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
     assert x.stride(2) == 1 and x.stride(1) == 4096 and x.stride(0) >= 8192
     partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
     _wo_a_partial[(16, 2, 8)](
-        x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
+        x, weight, partial, m, x.stride(0), SMALL_BATCH_MAX_ROWS, num_warps=4, num_stages=3
     )
     return _quantize_partial(partial)
