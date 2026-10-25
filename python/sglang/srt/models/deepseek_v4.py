@@ -230,6 +230,7 @@ def _small_verify_max_rows() -> int:
 
 
 _logged_small_verify_rows: set = set()
+_logged_mega_mhc_rows: set = set()
 
 
 def _log_small_verify_paths_once(rows: int) -> None:
@@ -3485,11 +3486,79 @@ class DeepseekV4DecoderLayer(nn.Module):
             else None
         )
 
-    def _hc_post_with_combine(
-        self, x, residual, post, comb, pre, forward_batch, norm=None
-    ):
-        """Return updated HC streams and optional combined/normalized inputs."""
+    def _mega_mhc_verify_ok(self, x, residual, post, comb, pre, forward_batch, norm):
+        """SGLANG_OPT_DSV4_MEGA_MHC_VERIFY: decode / target-verify rows below the
+        TileLang mhc_post window take the DeepGEMM mega-mHC boundary (post + next
+        combine + norm + Sinkhorn in one launch). Off by default."""
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        return (
+            envs.SGLANG_OPT_DSV4_MEGA_MHC_VERIFY.get()
+            and self.config.model_type == "deepseek_v41"
+            and x.is_cuda
+            and get_platform().is_blackwell
+            and 0 < x.shape[0] < 128
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and x.shape[1] == 5120
+            and self.hc_mult == 4
+            and x.dtype == residual.dtype == torch.bfloat16
+            and post.dtype == comb.dtype == pre.dtype == torch.float32
+            and all(t.is_contiguous() for t in (x, residual, post, comb, pre))
+            and norm is not None
+            and not norm.cast_x_before_out_mul
+            and norm.variance_size_override is None
+            and norm.weight.dtype == torch.bfloat16
+            and norm.weight.shape == (5120,)
+            and norm.weight.is_contiguous()
+            and get_parallel().attn_dp_size == 1
+            and not get_forward().sp_active
+            and not self.dsa_enable_prefill_cp
+            and not is_batch_invariant_mode_enabled()
+        )
+
+    def _hc_post_with_combine(
+        self, x, residual, post, comb, pre, forward_batch, norm=None, next_hc=None
+    ):
+        """Return updated HC streams and optional combined/normalized inputs.
+
+        ``next_hc`` = (fn, scale, base) of the sublayer that consumes ``norm``'s
+        output; when given, the mega-mHC boundary can fold its combine + norm in.
+        """
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        if next_hc is not None and self._mega_mhc_verify_ok(
+            x, residual, post, comb, pre, forward_batch, norm
+        ):
+            from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+
+            next_fn, next_scale, next_base = next_hc
+            if x.shape[0] not in _logged_mega_mhc_rows:
+                _logged_mega_mhc_rows.add(x.shape[0])
+                logger.warning(
+                    "dsv4 SGLANG_OPT_DSV4_MEGA_MHC_VERIFY: mega-mHC boundary on for %d rows (%s)",
+                    x.shape[0], forward_batch.forward_mode,
+                )
+            updated, normalized, _next_stats = mhc_mega_boundary(
+                x,
+                residual,
+                pre,
+                post,
+                comb,
+                next_fn,
+                next_scale,
+                next_base,
+                norm.weight,
+                self.rms_norm_eps,
+                self.hc_eps,
+                norm.variance_epsilon,
+                self.hc_sinkhorn_iters,
+            )
+            # TODO(item 1, step 2): hand _next_stats to the caller so the next
+            # sublayer skips its _hc_mix_stats launches.
+            return updated, None, normalized
 
         if (
             self.config.model_type == "deepseek_v41"
@@ -3692,6 +3761,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 attn_pre,
                 forward_batch,
                 norm=self.post_attention_layernorm,
+                next_hc=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
             )
 
         residual = hidden_states

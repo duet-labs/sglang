@@ -1532,6 +1532,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    # specagon item 1: DeepGEMM mega-mHC boundary (post + next combine + norm + Sinkhorn in one
+    # launch) for decode / target-verify rows below the TileLang mhc_post window. Default off.
+    SGLANG_OPT_DSV4_MEGA_MHC_VERIFY = EnvBool(False)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
