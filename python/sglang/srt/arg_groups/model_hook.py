@@ -301,7 +301,11 @@ def handle_model_specific_adjustments(server_args: Any):
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
             ):  # CUDA or ROCm GPU
-                if cfg.enable_prefill_cp:
+                # Breakable prefill graphs run under CP via the BCG split op.
+                if (
+                    cfg.enable_prefill_cp
+                    and cfg.cuda_graph_backend_prefill != "breakable"
+                ):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).

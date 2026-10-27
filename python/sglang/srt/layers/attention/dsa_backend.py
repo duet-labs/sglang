@@ -3751,7 +3751,11 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 rope_positions = forward_batch.positions
-                if dsa_use_prefill_cp(forward_batch):
+                # BCG replay hands over pre-sharded positions.
+                if (
+                    dsa_use_prefill_cp(forward_batch)
+                    and rope_positions.shape[0] != k.shape[0]
+                ):
                     rope_positions = get_cp_strategy().shard_position_ids(
                         rope_positions, forward_batch
                     )
@@ -3771,6 +3775,11 @@ class DeepseekSparseAttnBackend(
                     k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
                         forward_batch, k, k_rope
                     )
+                    # BCG replay gathers padded bucket rows; store only the live ones.
+                    n_loc = forward_batch.out_cache_loc.shape[0]
+                    if k.shape[0] > n_loc:
+                        k = k[:n_loc]
+                        k_rope = k_rope[:n_loc]
             merge_query = False
 
             # Save KV cache if requested
