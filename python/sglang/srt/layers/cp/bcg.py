@@ -57,7 +57,11 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
         and resolved.attn_cp_size == cfg.tp_size
         and (
             (cfg.cp_strategy == "zigzag" and prefill_attention_backend == "trtllm_mha")
-            or (cfg.cp_strategy == "interleave" and prefill_attention_backend == "dsv4")
+            # `dsa` (still None when the hook runs) takes the dsv4 BCG path.
+            or (
+                cfg.cp_strategy == "interleave"
+                and prefill_attention_backend in ("dsv4", "dsa", None)
+            )
         )
     )
 
