@@ -158,10 +158,13 @@ def pcg_dsa_indexer_prefill_split(
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
+    # Under interleave BCG the gathered key carries the bucket's padded global
+    # rows (padding sits at the tail); the fused store wants one row per slot.
+    n_loc = forward_batch.out_cache_loc.shape[0]
     indexer._store_index_k_cache(
         forward_batch=forward_batch,
         layer_id=layer_id,
-        key=key if in_cp else key[:extend_num_tokens],
+        key=key[:n_loc] if in_cp else key[:extend_num_tokens],
         act_quant=act_quant,
         out_cache_loc=None
         if in_cp
