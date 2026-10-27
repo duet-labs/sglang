@@ -111,6 +111,8 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
+        self.tree_pre_node_list = []
+        self.tree_pre_pop_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -169,6 +171,8 @@ class MambaAttnBackendBase(AttentionBackend):
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
+        tree_pre_node = None
+        tree_pre_pop = None
         track_conv_indices = None
         track_ssm_h_src = None
         track_chunk_idx = None
@@ -295,12 +299,17 @@ class MambaAttnBackendBase(AttentionBackend):
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
+                    tree_pre_node = getattr(forward_batch.spec_info, "tree_pre_node", None)
+                    tree_pre_pop = getattr(forward_batch.spec_info, "tree_pre_pop", None)
                     retrieve_next_sibling = (
                         forward_batch.spec_info.retrieve_next_sibling
                     )
                     # None during dummy run
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                        tree_parents = getattr(forward_batch.spec_info, "tree_parents", None)
+                        if tree_parents is not None:
+                            retrieve_parent_token.copy_(tree_parents)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -348,6 +357,8 @@ class MambaAttnBackendBase(AttentionBackend):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
+            tree_pre_node=tree_pre_node,
+            tree_pre_pop=tree_pre_pop,
             track_conv_indices=track_conv_indices,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
@@ -407,6 +418,14 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_sibling_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
             spec_info.retrieve_next_sibling
         )
+        tree_parents = getattr(spec_info, "tree_parents", None)
+        if tree_parents is not None:
+            self.retrieve_parent_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
+                tree_parents
+            )
+        if getattr(spec_info, "tree_pre_node", None) is not None:
+            self.tree_pre_node_list[cuda_graph_bs - 1][:bs_without_pad].copy_(spec_info.tree_pre_node)
+            self.tree_pre_pop_list[cuda_graph_bs - 1][:bs_without_pad].copy_(spec_info.tree_pre_pop)
 
     def _init_track_conv_indices(
         self,
@@ -651,6 +670,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            self.tree_pre_node_list.append(
+                torch.zeros((i + 1, draft_token_num), dtype=torch.int64, device=self.device)
+            )
+            self.tree_pre_pop_list.append(
+                torch.zeros((i + 1, draft_token_num), dtype=torch.int64, device=self.device)
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -730,6 +755,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                tree_pre_node=self.tree_pre_node_list[bs - 1],
+                tree_pre_pop=self.tree_pre_pop_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -920,6 +947,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
                     spec_info.retrieve_next_sibling
                 )
+                tree_parents = getattr(spec_info, "tree_parents", None)
+                if tree_parents is not None:
+                    self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
+                        tree_parents
+                    )
+                if getattr(spec_info, "tree_pre_node", None) is not None:
+                    self.tree_pre_node_list[bs - 1][:bs_without_pad].copy_(spec_info.tree_pre_node)
+                    self.tree_pre_pop_list[bs - 1][:bs_without_pad].copy_(spec_info.tree_pre_pop)
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -927,6 +962,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                tree_pre_node=self.tree_pre_node_list[bs - 1],
+                tree_pre_pop=self.tree_pre_pop_list[bs - 1],
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )

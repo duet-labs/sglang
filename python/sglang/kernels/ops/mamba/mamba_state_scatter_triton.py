@@ -6,6 +6,7 @@ This kernel replaces the expensive advanced indexing operations in
 avoiding multiple `index_elementwise_kernel` launches.
 """
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -692,6 +693,11 @@ def fused_conv_window_scatter_multi(
     )
 
 
+# Set True by the DFS tree verify path for the current step (reset by the
+# worker after commit); the chain path never sets it.
+DFS_SSM_COMMITTED = [False]
+
+
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,
@@ -705,7 +711,9 @@ def scatter_mamba_states_after_mtp_verify(
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
 
-    if ssm_states.numel() > 0:
+    # DFS tree verify (SGLANG_DFLASH_TREE_DFS_VERIFY=1) commits the SSM state by
+    # replaying the accepted path; there are no per-node snapshots to scatter.
+    if ssm_states.numel() > 0 and not DFS_SSM_COMMITTED[0]:
         fused_mamba_state_scatter_with_mask(
             ssm_states,
             intermediate_state_cache,

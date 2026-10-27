@@ -4,6 +4,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
+import os
 import torch
 from einops import rearrange
 
@@ -1192,6 +1193,95 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    @staticmethod
+    def _drop_non_ancestor_tree_tokens(topk_result: torch.Tensor, forward_batch: ForwardBatch) -> None:
+        """After top-k: when index_topk >= the causal length every candidate (incl. -inf
+        non-ancestor tree slots) is selected, so drop them from the index list (-1 = skip),
+        mirroring the kpool path's _mask_non_ancestor_tree_tokens. Graph-static inputs only."""
+        if os.environ.get("SGLANG_DSA_TREE_TOPK_DROP", "0") != "1":
+            return
+        spec_info = forward_batch.spec_info
+        if not forward_batch.forward_mode.is_target_verify() or spec_info is None:
+            return
+        anc_all = getattr(spec_info, "tree_ancestor_mask", None)
+        if anc_all is None:
+            return
+        num_nodes = int(spec_info.draft_token_num)
+        seq_lens = forward_batch.seq_lens
+        bs = seq_lens.shape[0]
+        rows = bs * num_nodes
+        anc_all = anc_all.reshape(-1, num_nodes)
+        if topk_result.shape[0] < rows or anc_all.shape[0] < rows:
+            return
+        if not getattr(Indexer, "_tree_drop_logged", False):
+            Indexer._tree_drop_logged = True
+            t = topk_result[:rows]
+            logger.info("DFLASH tree: topk_result shape=%s dtype=%s contiguous=%s min=%s max=%s seq_lens[:2]=%s N=%s",
+                        tuple(topk_result.shape), topk_result.dtype, topk_result.is_contiguous(),
+                        int(t.min()), int(t.max()), seq_lens[:2].tolist(), num_nodes)
+        if os.environ.get("SGLANG_DSA_TREE_DROP_SPACE", "physical") == "physical" and forward_batch.out_cache_loc is not None \
+                and forward_batch.out_cache_loc.numel() >= rows:
+            # fused top-k returns kv-cache (physical) slots: the verify window's slots are out_cache_loc
+            slots = forward_batch.out_cache_loc[:rows].view(bs, num_nodes).to(topk_result.dtype)
+        else:
+            slots = (seq_lens.to(topk_result.dtype)[:, None] + torch.arange(num_nodes, device=topk_result.device, dtype=topk_result.dtype))  # [bs, N] logical positions
+        banned = torch.where(
+            anc_all[:rows].bool().view(bs, num_nodes, num_nodes),
+            torch.full_like(slots[:1, :1], -2).expand(bs, num_nodes, num_nodes),
+            slots.unsqueeze(1).expand(bs, num_nodes, num_nodes),
+        ).reshape(rows, num_nodes)
+        hit = (topk_result[:rows].unsqueeze(-1) == banned.unsqueeze(1)).any(-1)
+        topk_result[:rows].masked_fill_(hit, -1)
+        # the sparse-attention page-table transform only tolerates -1 as tail padding
+        # (interior -1 -> illegal memory access): compact valid indices to the front
+        topk_result[:rows].copy_(topk_result[:rows].sort(dim=1, descending=True).values)
+
+    @staticmethod
+    def _mask_non_ancestor_tree_slots(
+        logits: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Tree verify (DFLASH selector tree): the per-token causal length lets
+        node i see every lower-numbered tree slot; drop the slots that are not
+        on i's root path so the sparse top-k only selects prefix + ancestors.
+        Reads only graph-static inputs (ancestor matrix [cap*N, N] kept by the
+        graph runner, seq_lens, draft_token_num) so it is CUDA-graph safe."""
+        spec_info = forward_batch.spec_info
+        if not forward_batch.forward_mode.is_target_verify() or spec_info is None:
+            return
+        anc_all = getattr(spec_info, "tree_ancestor_mask", None)
+        if anc_all is None:
+            return
+        num_nodes = int(spec_info.draft_token_num)
+        seq_lens = forward_batch.seq_lens
+        bs = seq_lens.shape[0]
+        rows = bs * num_nodes
+        anc_all = anc_all.reshape(-1, num_nodes)
+        if logits.shape[0] < rows or anc_all.shape[0] < rows:
+            if not getattr(Indexer, "_tree_mask_skip_logged", False):
+                Indexer._tree_mask_skip_logged = True
+                logger.warning(
+                    "DFLASH tree: indexer logits rows %s / anc rows %s < bs*nodes %s; "
+                    "non-ancestor mask skipped.",
+                    tuple(logits.shape),
+                    anc_all.shape[0],
+                    rows,
+                )
+            return
+        if not getattr(Indexer, "_tree_mask_apply_logged", False):
+            Indexer._tree_mask_apply_logged = True
+            logger.info(
+                "DFLASH tree: masking non-ancestor tree slots in indexer logits %s (bs=%s, N=%s)",
+                tuple(logits.shape), bs, num_nodes,
+            )
+        cols = (
+            seq_lens.to(torch.int64)[:, None, None]
+            + torch.arange(num_nodes, device=logits.device, dtype=torch.int64)
+        ).expand(bs, num_nodes, num_nodes).reshape(rows, num_nodes)
+        cols = cols.clamp(max=logits.shape[1] - 1).contiguous()  # expand→reshape may alias; no in-place op
+        vals = logits[:rows].gather(1, cols)
+        vals.masked_fill_(~anc_all[:rows].bool(), float("-inf"))
+        logits[:rows].scatter_(1, cols, vals)
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1423,7 +1513,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
+        if os.environ.get("SGLANG_DSA_TREE_LOGITS_MASK") == "1":
+            # -inf logits into topk_transform produced invalid indices (IMA) on GLM-5.3;
+            # default: let top-k pick the slots and drop non-ancestors from the index list below
+            self._mask_non_ancestor_tree_slots(logits, forward_batch)
         topk_result = metadata.topk_transform(logits, self.index_topk)
+        self._drop_non_ancestor_tree_tokens(topk_result, forward_batch)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset

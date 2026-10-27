@@ -125,6 +125,71 @@ def _mqa_logits_row_chunks(
     )
 
 
+_DFLASH_TREE_KPOOL_REPLAY: dict = {}
+_DFLASH_TREE_KPOOL_PLAN: dict = {}
+
+
+def _dflash_tree_scratch(store: dict, name, like: torch.Tensor) -> torch.Tensor:
+    """Graph-independent copy target (captured graphs own their own buffers)."""
+    buf = store.get(name)
+    if buf is None or buf.shape[0] < like.shape[0] or buf.dtype != like.dtype:
+        buf = torch.empty_like(like)
+        store[name] = buf
+    return buf[: like.shape[0]]
+
+
+def _dflash_tree_stash(layer_id: int, key, score, plan, consts: dict) -> None:
+    layer = _DFLASH_TREE_KPOOL_REPLAY.setdefault(layer_id, {})
+    _dflash_tree_scratch(layer, "key", key).copy_(key)
+    _dflash_tree_scratch(layer, "score", score).copy_(score)
+    layer.update(consts)
+    for name in ("req", "write_start", "tail_logical_start", "write_loc"):
+        src = getattr(plan, name)
+        _dflash_tree_scratch(_DFLASH_TREE_KPOOL_PLAN, name, src).copy_(src)
+
+
+def dflash_tree_kpool_replay(
+    path_rows: torch.Tensor,
+    accept_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    bs: int,
+    num_nodes: int,
+) -> None:
+    """Re-run the k-pool tail/pool write along the accepted tree path.
+
+    The verify write stores row i at position seq_len+i and closes pools from
+    row order, which only matches a chain. `path_rows` is [bs, num_nodes]
+    global verify-row ids of the accepted path (anchor first, padded past
+    accept_lens); only the first accept_lens[b] entries take effect.
+    """
+    if not _DFLASH_TREE_KPOOL_REPLAY:
+        return
+    from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+        kpool_write_tail_and_maybe_compress,
+    )
+
+    idx = path_rows.reshape(-1).to(torch.long)
+    eff = accept_lens.to(torch.int32)
+    plan = _DFLASH_TREE_KPOOL_PLAN
+    for layer in _DFLASH_TREE_KPOOL_REPLAY.values():
+        kpool_write_tail_and_maybe_compress(
+            pool=layer["pool"],
+            buf=layer["buf"],
+            key=layer["key"][idx],
+            score=layer["score"][idx],
+            tail_k=layer["tail_k"],
+            tail_score=layer["tail_score"],
+            ape=layer["ape"],
+            req_pool_indices=plan["req"][:bs],
+            write_start=plan["write_start"][:bs],
+            tail_logical_start=plan["tail_logical_start"][:bs],
+            write_loc=plan["write_loc"][:bs],
+            out_cache_loc=out_cache_loc,
+            num_draft_tokens=num_nodes,
+            round_scale=layer["round_scale"],
+            effective_n_per_batch=eff,
+        )
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -1072,7 +1137,71 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets=topk_offsets,
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
+        self._mask_non_ancestor_tree_tokens(
+            topk_result, forward_batch, physical=page_table_1 is not None
+        )
         return topk_result
+
+    _tree_mask_logged = False
+
+    @classmethod
+    def _mask_non_ancestor_tree_tokens(
+        cls, topk_result: torch.Tensor, forward_batch: ForwardBatch, *, physical: bool
+    ) -> None:
+        """Tree verify (spec_info.tree_ancestor_mask set): the pooled top-k
+        returns physical token ids, including the verify-window slots the
+        per-token causal length admits. Drop the slots that are not on the
+        query node's root path so sparse attention sees prefix + ancestors.
+        Reads only graph-static inputs (ancestor matrix, seq_lens, out_cache_loc)."""
+        spec_info = forward_batch.spec_info
+        if not forward_batch.forward_mode.is_target_verify() or spec_info is None:
+            return
+        anc_all = getattr(spec_info, "tree_ancestor_mask", None)
+        if anc_all is None:
+            return
+        num_nodes = int(spec_info.draft_token_num)
+        seq_lens = forward_batch.seq_lens
+        bs = seq_lens.shape[0]
+        rows = bs * num_nodes
+        anc_all = anc_all.reshape(-1, num_nodes)
+        if (
+            topk_result.shape[0] < rows
+            or anc_all.shape[0] < rows
+            or (physical and forward_batch.out_cache_loc.numel() < rows)
+        ):
+            if not cls._tree_mask_logged:
+                cls._tree_mask_logged = True
+                logger.warning(
+                    "DFLASH tree: kpool topk rows %s / anc rows %s < bs*nodes %s; "
+                    "non-ancestor mask skipped.",
+                    tuple(topk_result.shape),
+                    anc_all.shape[0],
+                    rows,
+                )
+            return
+        device = topk_result.device
+        offsets = torch.arange(num_nodes, device=device, dtype=seq_lens.dtype)
+        cols = offsets.unsqueeze(0) + seq_lens.unsqueeze(1)  # [bs, N] logical slots
+        anc = anc_all[:rows]
+        if physical:
+            slots = forward_batch.out_cache_loc[:rows].view(bs, num_nodes)
+        else:
+            slots = cols  # logical positions: seq_len + slot
+        slots = slots.to(topk_result.dtype)
+        banned = torch.where(
+            anc.view(bs, num_nodes, num_nodes),
+            torch.full_like(slots[:1, :1], -2).expand(bs, num_nodes, num_nodes),
+            slots.unsqueeze(1).expand(bs, num_nodes, num_nodes),
+        ).reshape(rows, num_nodes)
+        hit = (topk_result[:rows].unsqueeze(-1) == banned.unsqueeze(1)).any(-1)
+        topk_result[:rows].masked_fill_(hit, -1)
+        if not cls._tree_mask_logged:
+            cls._tree_mask_logged = True
+            logger.info(
+                "DFLASH tree: masking non-ancestor verify slots in kpool topk %s (physical=%s)",
+                tuple(topk_result.shape),
+                physical,
+            )
 
     def _kpool_topk_by_row_chunks(
         self,
@@ -1596,11 +1725,10 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
-            kpool_write_tail_and_maybe_compress(
+            score = self._compute_gate_score_if_missing(x, gate_score_maybe)
+            write_kwargs = dict(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
@@ -1611,8 +1739,30 @@ class IndexerKPool(MultiPlatformOp):
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
-                effective_n_per_batch=plan.effective_n_per_batch,
             )
+            kpool_write_tail_and_maybe_compress(
+                key=key,
+                score=score,
+                effective_n_per_batch=plan.effective_n_per_batch,
+                **write_kwargs,
+            )
+            if getattr(forward_batch.spec_info, "tree_ancestor_mask", None) is not None:
+                # DFLASH tree: rows are nodes, not positions; the accepted path
+                # is re-pooled after accept (dflash_tree_kpool_replay).
+                _dflash_tree_stash(
+                    layer_id,
+                    key,
+                    score,
+                    plan,
+                    dict(
+                        pool=pool,
+                        buf=buf,
+                        tail_k=tail_k_buf,
+                        tail_score=tail_score_buf,
+                        ape=self.index_kpool_compress_ape,
+                        round_scale=self.scale_fmt is not None,
+                    ),
+                )
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()

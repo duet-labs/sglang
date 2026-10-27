@@ -23,6 +23,23 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 
 
+_DFLASH_TREE_ANC_STATIC: dict = {}
+_DFLASH_TREE_ANC_MAX_ROWS = 1 << 16
+
+
+def get_dflash_tree_anc_static(device, num_nodes: int) -> torch.Tensor:
+    """Graph-static [rows, N] ancestor matrix (all True until a replay copies the
+    step's real matrix in). Captured kernels index it by node row."""
+    key = (str(device), int(num_nodes))
+    buf = _DFLASH_TREE_ANC_STATIC.get(key)
+    if buf is None:
+        buf = torch.ones(
+            (_DFLASH_TREE_ANC_MAX_ROWS, int(num_nodes)), dtype=torch.bool, device=device
+        )
+        _DFLASH_TREE_ANC_STATIC[key] = buf
+    return buf
+
+
 @dataclass
 class DFlashVerifyInput(SpecInput):
     """Inputs for a target-model verify forward in DFlash.
@@ -41,6 +58,17 @@ class DFlashVerifyInput(SpecInput):
     # Custom attention "allow mask" for TARGET_VERIFY in backends that require it.
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
+    # Tree verify (DFlash2 selector tree): EAGLE-shaped node links read by the
+    # hybrid linear-attention backends (gated by `topk > 1`) and the tree
+    # accept kernels. None for the chain path.
+    retrieve_index: Optional[torch.Tensor] = None
+    retrieve_next_token: Optional[torch.Tensor] = None
+    retrieve_next_sibling: Optional[torch.Tensor] = None
+    tree_pre_node: Optional[torch.Tensor] = None  # [bs, N] preorder node ids (DFS verify)
+    tree_pre_pop: Optional[torch.Tensor] = None  # [bs, N] stack pops before pre_node[t]
+    # [bs, N, N] bool, ancestor_mask[b, i, j] = node j is i or an ancestor of i
+    tree_ancestor_mask: Optional[torch.Tensor] = None
+    tree_parents: Optional[torch.Tensor] = None  # [bs, N] parent node per node (root: 0); tree-parallel conv
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).

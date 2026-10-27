@@ -51,6 +51,8 @@ class ForwardMetadata:
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
     retrieve_parent_token: Optional[torch.Tensor] = None
+    tree_pre_node: Optional[torch.Tensor] = None
+    tree_pre_pop: Optional[torch.Tensor] = None
     # For prefill radix cache
     track_conv_indices: Optional[torch.Tensor] = None
     track_ssm_h_src: Optional[torch.Tensor] = None

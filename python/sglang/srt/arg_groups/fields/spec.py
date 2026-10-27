@@ -71,6 +71,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dflash_tree_nodes: A[
+        Optional[int],
+        "DFLASH (DFlash2 selector drafts) only. Verify a best-first tree of this many nodes (anchor included) built from the selector lattice instead of one chain; sets --speculative-num-draft-tokens to this value while the draft keeps its own block size. Experimental.",
+    ] = None
     speculative_domino_candidate_pool_size: A[
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",

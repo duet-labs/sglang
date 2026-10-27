@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -2245,6 +2246,10 @@ class DeepseekSparseAttnBackend(
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
+            elif topk_transform_method == TopkTransformMethod.PAGED and _dflash_tree_fused_transform_filter(
+                forward_batch, metadata, topk_indices
+            ):
+                page_table_1 = forward_batch._dflash_tree_fused_pt
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
@@ -2280,6 +2285,12 @@ class DeepseekSparseAttnBackend(
                     page_table_1
                 ).to(torch.int32)
 
+        if getattr(forward_batch, "_dflash_tree_fused_pt", None) is not None and page_table_1 is forward_batch._dflash_tree_fused_pt:
+            pass  # fused transform+filter already produced the ancestor-only table + lengths
+        elif os.environ.get("SGLANG_DSA_TREE_PT_FILTER", "1") == "1":
+            forward_batch._dflash_tree_valid_len = None
+            forward_batch._dflash_tree_topk_len = None
+            page_table_1 = _dflash_tree_filter_page_table(page_table_1, forward_batch, metadata.dsa_cache_seqlens_int32)
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller
@@ -2395,7 +2406,7 @@ class DeepseekSparseAttnBackend(
                     page_table_1=page_table_1,
                     sm_scale=layer.scaling,
                     v_head_dim=layer.v_head_dim,
-                    topk_length=metadata.dsa_cache_seqlens_int32,
+                    topk_length=_dflash_tree_topk_length(metadata.dsa_cache_seqlens_int32, forward_batch),
                 )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -2403,7 +2414,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                topk_length=metadata.dsa_cache_seqlens_int32,
+                topk_length=_dflash_tree_topk_length(metadata.dsa_cache_seqlens_int32, forward_batch),
                 attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
@@ -2439,7 +2450,9 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
                 page_table=page_table_1,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                cache_seqlens=_dflash_tree_topk_length(
+                    metadata.dsa_cache_seqlens_int32, forward_batch
+                ),
                 cu_seqlens_q=metadata.dsa_cu_seqlens_q,
                 cu_seqlens_k=metadata.dsa_cu_seqlens_k,
                 max_seqlen_q=metadata.dsa_max_seqlen_q,
@@ -2572,6 +2585,10 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
 
+        if os.environ.get("SGLANG_DSA_TREE_PT_FILTER", "1") == "1":
+            forward_batch._dflash_tree_valid_len = None
+            forward_batch._dflash_tree_topk_len = None
+            page_table_1 = _dflash_tree_filter_page_table(page_table_1, forward_batch, metadata.dsa_cache_seqlens_int32)
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2581,7 +2598,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
-                topk_length=metadata.dsa_cache_seqlens_int32,
+                topk_length=_dflash_tree_topk_length(metadata.dsa_cache_seqlens_int32, forward_batch),
                 attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
@@ -2638,7 +2655,9 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
                 page_table=page_table_1,
-                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                cache_seqlens=_dflash_tree_topk_length(
+                    metadata.dsa_cache_seqlens_int32, forward_batch
+                ),
                 cu_seqlens_q=metadata.dsa_cu_seqlens_q,
                 cu_seqlens_k=metadata.dsa_cu_seqlens_k,
                 max_seqlen_q=metadata.dsa_max_seqlen_q,
@@ -4299,3 +4318,150 @@ class DeepseekSparseAttnMultiStepBackend:
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
+
+
+def _dflash_tree_filter_page_table(page_table_1, forward_batch, cache_seqlens=None):
+    """Tree verify (DFLASH selector tree) on the non-kpool DSA path: the per-token causal
+    length admits every lower-numbered verify slot; replace the slots that are not on the
+    query node's root path with -1 (skipped by the sparse kernels' page-table mask).
+    Graph-static inputs only (static ancestor matrix, seq_lens, out_cache_loc)."""
+    spec_info = forward_batch.spec_info
+    if not forward_batch.forward_mode.is_target_verify() or spec_info is None:
+        return page_table_1
+    anc_all = getattr(spec_info, "tree_ancestor_mask", None)
+    if anc_all is None or forward_batch.out_cache_loc is None:
+        return page_table_1
+    num_nodes = int(spec_info.draft_token_num)
+    bs = forward_batch.seq_lens.shape[0]
+    rows = bs * num_nodes
+    anc_all = anc_all.reshape(-1, num_nodes)
+    if page_table_1.shape[0] < rows or anc_all.shape[0] < rows or forward_batch.out_cache_loc.numel() < rows:
+        return page_table_1
+    slots = forward_batch.out_cache_loc[:rows].view(bs, num_nodes).to(page_table_1.dtype)
+    pt = page_table_1[:rows]
+    seq = cache_seqlens if (cache_seqlens is not None and cache_seqlens.shape[0] >= rows) else None
+    mode = os.environ.get("SGLANG_DSA_TREE_PT_MODE", "neg1")
+    use_triton = os.environ.get("SGLANG_DSA_TREE_PT_TRITON", "1") == "1"
+    check = os.environ.get("SGLANG_DSA_TREE_PT_CHECK") == "1"
+    if mode == "neg1" and use_triton and not check:
+        # Fused path: the kernel derives the banned slots from (anc, slots) itself, so
+        # skip the [rows, W, N] torch compare/or-reduce that cost ~1 ms/step x 78 layers.
+        from sglang.srt.speculative.dsa_tree_filter import dsa_tree_filter_page_table
+        out_t, vl_t = dsa_tree_filter_page_table(page_table_1, rows, num_nodes, slots, anc_all[:rows], seq)
+        forward_batch._dflash_tree_valid_len = vl_t[:rows]
+        # With per-row seqlens the survivors already exclude positions >= seqlen, so the
+        # valid count IS min(seqlen, #valid); pad rows carry their seqlen, so the full
+        # buffer replaces cache_seqlens for the attention kernels without another op.
+        forward_batch._dflash_tree_topk_len = (
+            vl_t if (seq is not None and vl_t.shape[0] == cache_seqlens.shape[0]) else None
+        )
+        return out_t
+
+    def _hit():
+        banned = torch.where(
+            anc_all[:rows].bool().view(bs, num_nodes, num_nodes),
+            torch.full_like(slots[:1, :1], -2).expand(bs, num_nodes, num_nodes),
+            slots.unsqueeze(1).expand(bs, num_nodes, num_nodes),
+        ).reshape(rows, num_nodes)
+        return (page_table_1[:rows].unsqueeze(-1) == banned.unsqueeze(1)).any(-1)
+
+    hit = _hit()
+    if os.environ.get("SGLANG_DSA_TREE_PT_DEBUG") == "1" and int(forward_batch.seq_lens[0]) > 8:
+        n = getattr(_dflash_tree_filter_page_table, "_n", 0)
+        if n < 3:
+            _dflash_tree_filter_page_table._n = n + 1
+            logger.info("DFLASH tree PT dbg: hits=%s pt[:3,:20]=%s slots[0]=%s seq_len0=%s pt.shape=%s",
+                        int(hit.sum()), page_table_1[:3, :20].tolist(), slots[0].tolist(), int(forward_batch.seq_lens[0]), tuple(page_table_1.shape))
+    out = page_table_1.clone()
+    if mode == "noop":
+        return out
+    if mode == "self":
+        own = slots.reshape(rows, 1).expand(rows, page_table_1.shape[1])
+        out[:rows] = torch.where(hit, own, page_table_1[:rows])
+        return out
+    # Entries at positions >= the row's causal length are stale page-table slots that the
+    # kernels mask by cache_seqlens; they must not survive compaction. Mask them, then
+    # compact in original order (stable sort on the "dropped" flag) so the first
+    # #valid entries are exactly prefix + ancestors.
+    if os.environ.get("SGLANG_DSA_TREE_PT_TRITON", "1") == "1":
+        from sglang.srt.speculative.dsa_tree_filter import dsa_tree_filter_page_table
+        out_t, vl_t = dsa_tree_filter_page_table(
+            page_table_1, rows, num_nodes, forward_batch.out_cache_loc[:rows].view(bs, num_nodes), anc_all[:rows], seq
+        )
+        if os.environ.get("SGLANG_DSA_TREE_PT_CHECK") != "1":
+            forward_batch._dflash_tree_valid_len = vl_t[:rows]
+            return out_t
+    if seq is not None:
+        pos = torch.arange(pt.shape[1], device=pt.device, dtype=seq.dtype)
+        hit = hit | (pos[None, :] >= seq[:rows, None])
+    dropped = hit | (pt < 0)
+    order = dropped.to(torch.int8).argsort(dim=1, stable=True)
+    out[:rows] = torch.gather(pt.masked_fill(dropped, -1), 1, order)
+    forward_batch._dflash_tree_valid_len = (~dropped).sum(dim=1).to(torch.int32)
+    if os.environ.get("SGLANG_DSA_TREE_PT_CHECK") == "1" and os.environ.get("SGLANG_DSA_TREE_PT_TRITON", "1") == "1":
+        if not (torch.equal(out_t, out) and torch.equal(vl_t[:rows], forward_batch._dflash_tree_valid_len)):
+            logger.error("DFLASH tree PT triton/torch MISMATCH: rows=%s out_diff=%s vl_diff=%s",
+                         rows, int((out_t != out).sum()), int((vl_t[:rows] != forward_batch._dflash_tree_valid_len).sum()))
+    return out
+
+
+def _dflash_tree_topk_length(cache_seqlens, forward_batch):
+    """flashmla_sparse only masks -1 beyond topk_length; after the tree filter the
+    valid (non -1) count per row shrinks, so pass min(seqlen, #valid)."""
+    vl = getattr(forward_batch, "_dflash_tree_valid_len", None)
+    if vl is None or cache_seqlens is None:
+        return cache_seqlens
+    tl_ = getattr(forward_batch, "_dflash_tree_topk_len", None)
+    if tl_ is not None and tl_.shape[0] == cache_seqlens.shape[0] and tl_.dtype == cache_seqlens.dtype:
+        return tl_
+    rows = vl.shape[0]
+    if cache_seqlens.shape[0] != rows:
+        # per-request seqlens -> per-verify-row (bs*N) so flashmla_sparse keeps topk_length
+        if rows % cache_seqlens.shape[0] != 0:
+            return cache_seqlens
+        n_per = rows // cache_seqlens.shape[0]
+        out = cache_seqlens.repeat_interleave(n_per)
+    else:
+        out = cache_seqlens.clone()
+    out[:rows] = torch.minimum(out[:rows], vl.to(out.dtype))
+    return out
+
+
+def _dflash_tree_fused_transform_filter(forward_batch, metadata, topk_indices):
+    """Tree verify: one kernel per layer does the top-k page-table transform AND the
+    ancestor filter (replaces transform_index_page_table_prefill + the per-layer filter).
+    Sets forward_batch._dflash_tree_fused_pt / _dflash_tree_valid_len / _dflash_tree_topk_len."""
+    forward_batch._dflash_tree_fused_pt = None
+    if os.environ.get("SGLANG_DSA_TREE_FUSED_TRANSFORM", "1") != "1":
+        return False
+    spec_info = forward_batch.spec_info
+    if not forward_batch.forward_mode.is_target_verify() or spec_info is None or topk_indices is None:
+        return False
+    anc_all = getattr(spec_info, "tree_ancestor_mask", None)
+    if anc_all is None or forward_batch.out_cache_loc is None:
+        return False
+    num_nodes = int(spec_info.draft_token_num)
+    bs = forward_batch.seq_lens.shape[0]
+    rows = bs * num_nodes
+    anc_all = anc_all.reshape(-1, num_nodes)
+    seq = metadata.dsa_cache_seqlens_int32
+    pt = metadata.page_table_1
+    if (
+        topk_indices.shape[0] < rows or anc_all.shape[0] < rows or forward_batch.out_cache_loc.numel() < rows
+        or seq is None or seq.shape[0] != topk_indices.shape[0] or pt.shape[0] != topk_indices.shape[0]
+    ):
+        return False
+    from sglang.srt.speculative.dsa_tree_filter import dsa_tree_transform_filter
+
+    # layers that reuse the previous layer's top-k get the same filtered table
+    last = getattr(forward_batch, "_dflash_tree_fused_key", None)
+    if last is not None and last[0] == topk_indices.data_ptr() and last[1] == tuple(topk_indices.shape):
+        forward_batch._dflash_tree_fused_pt, forward_batch._dflash_tree_valid_len, forward_batch._dflash_tree_topk_len = last[2]
+        return True
+    slots = forward_batch.out_cache_loc[:rows].view(bs, num_nodes).to(torch.int32)
+    out, vl = dsa_tree_transform_filter(topk_indices, pt, rows, num_nodes, slots, anc_all[:rows], seq, expanded=True)
+    forward_batch._dflash_tree_fused_key = (topk_indices.data_ptr(), tuple(topk_indices.shape), (out, vl[:rows], vl))
+    forward_batch._dflash_tree_fused_pt = out
+    forward_batch._dflash_tree_valid_len = vl[:rows]
+    forward_batch._dflash_tree_topk_len = vl
+    return True

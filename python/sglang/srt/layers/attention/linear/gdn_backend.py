@@ -1,7 +1,11 @@
 from typing import Optional, Tuple, Union
 
 import msgspec
+import logging
+import os
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -479,6 +483,36 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        tree_pre_node = kwargs.pop("tree_pre_node", None)
+        tree_pre_pop = kwargs.pop("tree_pre_pop", None)
+        dfs_layer_id = kwargs.pop("dfs_layer_id", None)
+        tree_next_token = kwargs.pop("tree_next_token", None)
+        tree_next_sibling = kwargs.pop("tree_next_sibling", None)
+        if (
+            kwargs.get("retrieve_parent_token") is not None
+            and os.environ.get("SGLANG_DFLASH_TREE_WY_VERIFY") == "1"
+        ):
+            if _WY.get("am") is None:
+                N = int(kwargs["cache_steps"])
+                _WY["am"] = torch.zeros((256, N, N), dtype=torch.int8, device=q.device)
+                _WY["aim"] = torch.zeros((256, N, N), dtype=torch.int8, device=q.device)
+            return self._target_verify_tree_wy(
+                A_log, dt_bias, q, k, v, a, b, ssm_states=ssm_states,
+                cache_indices=cache_indices, dfs_layer_id=dfs_layer_id,
+                query_start_loc=query_start_loc, **kwargs,
+            )
+        if (
+            kwargs.get("retrieve_parent_token") is not None
+            and tree_pre_node is not None
+            and os.environ.get("SGLANG_DFLASH_TREE_DFS_VERIFY") == "1"
+        ):
+            return self._target_verify_tree_dfs(
+                A_log, dt_bias, q, k, v, a, b, ssm_states=ssm_states,
+                cache_indices=cache_indices, query_start_loc=query_start_loc,
+                tree_pre_node=tree_pre_node, tree_pre_pop=tree_pre_pop,
+                dfs_layer_id=dfs_layer_id, tree_next_token=tree_next_token,
+                tree_next_sibling=tree_next_sibling, **kwargs,
+            )
         verify_kernel = self._get_target_verify_kernel(
             kwargs.get("retrieve_parent_token")
         )
@@ -496,6 +530,201 @@ class GDNKernelDispatcher:
             **kwargs,
         )
 
+    def _target_verify_tree_wy(
+        self, A_log, dt_bias, q, k, v, a, b, *, ssm_states, cache_indices, dfs_layer_id, cache_steps,
+        query_start_loc, retrieve_parent_token, **kwargs,
+    ):
+        """Closed-form (tree-masked WY) verify: all draft nodes in parallel from one read of
+        the pre-tree state; factors stored per layer for the commit (SGLANG_DFLASH_TREE_WY_VERIFY=1)."""
+        from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+        from sglang.kernels.ops.attention.fla.gdn_tree_wy import gdn_tree_wy_verify
+
+        T = int(cache_steps)
+        H, K = q.shape[-2], q.shape[-1]
+        rows = q.numel() // (H * K)
+        bs = rows // T  # padded batch during CUDA-graph capture/replay; masks of pad rows are zero
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+        q2, k2, v2 = q.view(rows, *q.shape[-2:]), k.view(rows, *k.shape[-2:]), v.view(rows, *v.shape[-2:])
+        o, U, CG = gdn_tree_wy_verify(
+            q2, k2, v2, g.view(rows, -1), beta.view(rows, -1), q.shape[-1] ** -0.5,
+            ssm_states, cache_indices[:bs], _WY["am"][:bs], _WY["aim"][:bs], 8,
+        )
+        st = _WY["layers"].setdefault(dfs_layer_id, {})
+        st["ssm_states"] = ssm_states
+        if "U" not in st or st["U"].shape[0] < bs or st["U"].shape[2] != T:
+            if torch.cuda.is_current_stream_capturing() and "U" in st:
+                raise RuntimeError("WY factor stash too small during CUDA graph capture")
+            cap = max(bs, cache_indices.shape[0])
+            # per-layer stashes are slices of one stacked buffer so the commit is a single launch
+            pool = getattr(ssm_states, "_base", None)
+            stk = _WY.get("stack")
+            if stk is None or stk["U"].shape[1] < cap or stk["U"].shape[3] != T:
+                L = pool.shape[0] if pool is not None and pool.dim() == 5 else 64
+                stk = dict(
+                    U=torch.empty((L, cap, *U.shape[1:]), dtype=U.dtype, device=U.device),
+                    CG=torch.empty((L, cap, *CG.shape[1:]), dtype=CG.dtype, device=CG.device),
+                    k=torch.empty((L, cap, T, *k.shape[-2:]), dtype=k.dtype, device=k.device),
+                    layer_off=torch.zeros((L,), dtype=torch.int64, device=U.device),
+                    pool=pool if pool is not None and pool.dim() == 5 else None,
+                    slot_of={}, n=0,
+                )
+                _WY["stack"] = stk
+            if dfs_layer_id not in stk["slot_of"]:
+                li = stk["n"]
+                stk["slot_of"][dfs_layer_id] = li
+                stk["n"] = li + 1
+                if stk["pool"] is not None:
+                    off = (ssm_states.data_ptr() - stk["pool"].data_ptr()) // (stk["pool"].stride(0) * stk["pool"].element_size())
+                    stk["layer_off"][li] = off
+            li = stk["slot_of"][dfs_layer_id]
+            st["U"], st["CG"], st["k"] = stk["U"][li], stk["CG"][li], stk["k"][li]
+        st["U"][:bs].copy_(U)
+        st["CG"][:bs].copy_(CG)
+        st["k"][:bs].copy_(k2.view(bs, T, *k.shape[-2:]))
+        if os.environ.get("SGLANG_DFLASH_TREE_WY_DEBUG") == "1":
+            st["dbg"] = dict(q=q2.clone().view(bs, T, *q.shape[-2:]), v=v2.clone().view(bs, T, *v.shape[-2:]),
+                             g=g.view(bs, T, -1).clone(), beta=beta.view(bs, T, -1).clone(), o=o.clone().view(bs, T, *o.shape[-2:]),
+                             cache_indices=cache_indices[:bs].clone(), parents=retrieve_parent_token[:bs].clone())
+        if (
+            os.environ.get("SGLANG_DFLASH_TREE_WY_DEBUG") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+            and _WY["aim"][:bs].any()
+        ):
+            _WY["dbg"] = _WY.get("dbg", 0) + 1
+            if _WY["dbg"] <= 96:
+                # WY mode shrinks the intermediate-state buffer to one step: give the
+                # snapshot-based reference its own full scratch buffer
+                dbg_kwargs = dict(kwargs)
+                dbg_kwargs["intermediate_states_buffer"] = torch.zeros(
+                    (bs, T, *ssm_states.shape[1:]), dtype=torch.float32, device=q.device
+                )
+                dbg_kwargs["intermediate_state_indices"] = torch.arange(bs, device=q.device, dtype=torch.int32)
+                ref = self._get_target_verify_kernel(retrieve_parent_token).target_verify(
+                    A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b, ssm_states=ssm_states.clone(),
+                    cache_indices=cache_indices, query_start_loc=query_start_loc,
+                    retrieve_parent_token=retrieve_parent_token, cache_steps=cache_steps, **dbg_kwargs,
+                )
+                d = (ref.float().reshape(-1) - o.float().reshape(-1)).abs()
+                if int(_WY["am"][:bs].sum().item()) == 0:
+                    logger.info("WY debug degenerate tree parents=%s", retrieve_parent_token[:bs].tolist())
+                logger.info(
+                    "WY debug layer=%s bs=%s T=%s ref.shape=%s o.shape=%s max|d|=%.3e mean|d|=%.3e ref|mean|=%.3e am.sum=%d aim.sum=%d",
+                    dfs_layer_id, bs, T, tuple(ref.shape), tuple(o.shape), d.max().item(), d.mean().item(),
+                    ref.float().abs().mean().item(), int(_WY["am"][:bs].sum().item()), int(_WY["aim"][:bs].sum().item()),
+                )
+        return o
+
+    def _target_verify_tree_dfs(
+        self, A_log, dt_bias, q, k, v, a, b, *, ssm_states, cache_indices,
+        query_start_loc, tree_pre_node, tree_pre_pop, retrieve_parent_token, cache_steps,
+        dfs_layer_id=None, tree_next_token=None, tree_next_sibling=None, **kwargs,
+    ):
+        """DFS tree verify: no per-node state snapshots; the accepted path is
+        committed by replay (SGLANG_DFLASH_TREE_DFS_VERIFY=1)."""
+        from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+        from sglang.kernels.ops.attention.fla.fused_recurrent_gdn_tree_dfs import (
+            fused_recurrent_gdn_tree_dfs,
+        )
+
+        T = int(cache_steps)
+        bs = tree_pre_node.shape[0]
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+        q4 = q.view(bs, T, *q.shape[-2:])
+        k4 = k.view(bs, T, *k.shape[-2:])
+        v4 = v.view(bs, T, *v.shape[-2:])
+        g4, beta4 = g.view(bs, T, -1), beta.view(bs, T, -1)
+        li = _ensure_dfs_stash(dfs_layer_id, q4, k4, v4, g4, beta4, ssm_states, cache_indices, cache_indices.shape[0])
+        st = _DFS_STACK
+        # deferred commit: the kernel first replays last step's accepted path
+        # (rows of the previous stash) and commits it, then walks the new tree
+        o = fused_recurrent_gdn_tree_dfs(
+            q4, k4, v4, g4, beta4,
+            q.shape[-1] ** -0.5, ssm_states, cache_indices[:bs],
+            tree_next_token[:bs], tree_next_sibling[:bs], retrieve_parent_token[:bs],
+            use_qk_l2norm_in_kernel=True,
+            pre_node=tree_pre_node[:bs], pre_pop=tree_pre_pop[:bs],
+            prev_inputs=(st["q"][li], st["k"][li], st["v"][li], st["g"][li], st["beta"][li]),
+            prev_row=st["prev_row"], prev_chain=st["prev_chain"],
+            row_strides=(q4.stride(1), k4.stride(1), v4.stride(1)),
+        )
+        for key, src in (("q", q4), ("k", k4), ("v", v4), ("g", g4), ("beta", beta4)):
+            st[key][li, :bs].copy_(src)
+        if os.environ.get("SGLANG_DFLASH_TREE_DFS_DEBUG") == "1" and not torch.cuda.is_current_stream_capturing():
+            ssm_c1, ssm_c2 = ssm_states.clone(), ssm_states.clone()
+            ref = self._get_target_verify_kernel(retrieve_parent_token).target_verify(
+                A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b, ssm_states=ssm_c1,
+                cache_indices=cache_indices, query_start_loc=query_start_loc,
+                retrieve_parent_token=retrieve_parent_token, cache_steps=cache_steps, **kwargs,
+            )
+            d = (ref.float().reshape(-1) - o.float().reshape(-1)).abs()
+            from sglang.kernels.ops.attention.fla.fused_recurrent import (
+                fused_recurrent_gated_delta_rule_update_fwd,
+            )
+
+            scratch = torch.zeros((bs, T, *ssm_states.shape[1:]), dtype=torch.float32, device=q.device)
+            ref2 = fused_recurrent_gated_delta_rule_update_fwd(
+                q4, k4, v4, g4, beta4, q.shape[-1] ** -0.5, ssm_c2, cache_indices[:bs],
+                use_qk_l2norm_in_kernel=True, disable_state_update=True,
+                intermediate_states_buffer=scratch,
+                intermediate_state_indices=torch.arange(bs, device=q.device, dtype=torch.int32),
+                cache_steps=T, retrieve_parent_token=retrieve_parent_token[:bs],
+            )
+            d2 = (ref.float().reshape(-1) - ref2.float().reshape(-1)).abs()
+            d3 = (o.float().reshape(-1) - ref2.float().reshape(-1)).abs()
+            # float64 torch tree reference on the same inputs
+            with torch.no_grad():
+                par = retrieve_parent_token[:bs].to(torch.int64)
+                HVn, Kd, Vd = ssm_states.shape[1], ssm_states.shape[2], ssm_states.shape[3]
+                Hn = q4.shape[2]
+                qd = torch.nn.functional.normalize(q4.double(), dim=-1, eps=0.0) if False else q4.double() / torch.sqrt((q4.double() ** 2).sum(-1, keepdim=True) + 1e-6)
+                kd = k4.double() / torch.sqrt((k4.double() ** 2).sum(-1, keepdim=True) + 1e-6)
+                qd = qd * (q.shape[-1] ** -0.5)
+                rep = HVn // Hn
+                qd = qd.repeat_interleave(rep, dim=2); kd = kd.repeat_interleave(rep, dim=2)
+                vd, gd, bd = v4.double(), g4.double(), beta4.double()
+                h0 = ssm_states[cache_indices[:bs].long()].double()  # [bs, HV, K, V]? check layout
+                o_t = torch.zeros_like(vd)
+                hs = [None] * T
+                for t in range(T):
+                    hp = h0 if t == 0 else hs[int(par[0, t].item())]
+                    # upstream layout: h[hv, k, v] with b_h indexed [v, k] tiles -> state[hv, v, k]? use [HV, K, V] as stored
+                    h = hp * torch.exp(gd[:, t])[:, :, None, None]
+                    kv = torch.einsum("bhkv,bhk->bhv", h, kd[:, t])
+                    dv = (vd[:, t] - kv) * bd[:, t][:, :, None]
+                    h = h + torch.einsum("bhk,bhv->bhkv", kd[:, t], dv)
+                    hs[t] = h
+                    o_t[:, t] = torch.einsum("bhkv,bhk->bhv", h, qd[:, t])
+                h0T = h0.transpose(-1, -2)
+                o_tT = torch.zeros_like(vd); hsT = [None] * T
+                for t in range(T):
+                    hp = h0T if t == 0 else hsT[int(par[0, t].item())]
+                    h = hp * torch.exp(gd[:, t])[:, :, None, None]
+                    kv = torch.einsum("bhkv,bhk->bhv", h, kd[:, t])
+                    dv = (vd[:, t] - kv) * bd[:, t][:, :, None]
+                    h = h + torch.einsum("bhk,bhv->bhkv", kd[:, t], dv)
+                    hsT[t] = h
+                    o_tT[:, t] = torch.einsum("bhkv,bhk->bhv", h, qd[:, t])
+            dr = (ref.double().reshape(-1) - o_t.reshape(-1)).abs().max().item()
+            dr2 = (ref2.double().reshape(-1) - o_t.reshape(-1)).abs().max().item()
+            drT = (ref.double().reshape(-1) - o_tT.reshape(-1)).abs().max().item()
+            dr2T = (ref2.double().reshape(-1) - o_tT.reshape(-1)).abs().max().item()
+            logger.info(
+                "DFS debug3 layer=%s torch-tree-ref: |ref-torch|=%.3e |ref2-torch|=%.3e | state transposed: |ref-torchT|=%.3e |ref2-torchT|=%.3e",
+                dfs_layer_id, dr, dr2, drT, dr2T,
+            )
+            logger.info(
+                "DFS debug2 layer=%s |ref-ref2(update kernel, my g/beta)|=%.3e  |dfs-ref2|=%.3e  a%s b%s g4 mean=%.3e beta4 mean=%.3e",
+                dfs_layer_id, d2.max().item(), d3.max().item(), tuple(a.shape), tuple(b.shape),
+                g4.float().mean().item(), beta4.float().mean().item(),
+            )
+            logger.info(
+                "DFS debug layer=%s bs=%d T=%d q%s k%s v%s ssm%s strides=%s dtype=%s ref%s | max|diff|=%.3e mean=%.3e ref_absmean=%.3e pre_node=%s pre_pop=%s",
+                dfs_layer_id, bs, T, tuple(q.shape), tuple(k.shape), tuple(v.shape), tuple(ssm_states.shape),
+                ssm_states.stride(), ssm_states.dtype, tuple(ref.shape), d.max().item(), d.mean().item(),
+                ref.float().abs().mean().item(), tree_pre_node[0].tolist(), tree_pre_pop[0].tolist(),
+            )
+        return o.view(bs * T, *o.shape[-2:])
+
     def target_verify_supports_strided_qkv(
         self, retrieve_parent_token: Optional[torch.Tensor]
     ) -> bool:
@@ -511,6 +740,277 @@ class GDNKernelDispatcher:
             if retrieve_parent_token is not None
             else self.verify_kernel
         )
+
+
+_DFS_VERIFY_STASH: dict = {}  # layer_id -> (ssm_states, cache_indices); tensors live in _DFS_STACK
+_WY: dict = {"layers": {}, "am": None, "aim": None, "bs": 0}  # closed-form tree verify state
+
+
+def dflash_tree_wy_prepare(ancestor_mask: torch.Tensor) -> None:
+    """Before the verify forward: inclusive ancestor mask [bs,N,N] (bool) -> graph-static int8
+    strict/inclusive masks read by every GDN layer's WY kernel."""
+    bs, N = ancestor_mask.shape[0], ancestor_mask.shape[1]
+    if _WY["am"] is None or _WY["am"].shape[0] < bs or _WY["am"].shape[1] != N:
+        cap = max(bs, 256)
+        _WY["am"] = torch.zeros((cap, N, N), dtype=torch.int8, device=ancestor_mask.device)
+        _WY["aim"] = torch.zeros((cap, N, N), dtype=torch.int8, device=ancestor_mask.device)
+    eye = torch.eye(N, dtype=torch.bool, device=ancestor_mask.device)
+    _WY["aim"][:bs].copy_(ancestor_mask.to(torch.int8))
+    _WY["am"][:bs].copy_((ancestor_mask & ~eye).to(torch.int8))
+    _WY["bs"] = bs
+
+
+_WY_COMMIT_STATIC: dict = {}
+
+
+def _wy_commit_graphed(accept_index, accept_lens, mamba_idx, bs, N):
+    """All layers' in-place WY commits (48 Triton launches + the accepted-node index prep) replayed
+    from one CUDA graph per batch size; stashes/masks are graph-static buffers."""
+    from sglang.kernels.ops.attention.fla.gdn_tree_wy import gdn_tree_wy_commit_inplace
+
+    key = (bs, accept_index.shape[1], N)
+    st = _WY_COMMIT_STATIC.get(key)
+    dev = accept_index.device
+    if st is None:
+        st = dict(
+            acc=torch.zeros((bs, accept_index.shape[1]), dtype=torch.int64, device=dev),
+            lens=torch.zeros((bs,), dtype=torch.int64, device=dev),
+            midx=torch.zeros((bs,), dtype=torch.int32, device=dev),
+            node=torch.zeros((bs,), dtype=torch.int32, device=dev),
+            graph=None, warm=0,
+        )
+        _WY_COMMIT_STATIC[key] = st
+    st["acc"].copy_(accept_index)
+    st["lens"].copy_(accept_lens[:bs])
+    st["midx"].copy_(mamba_idx[:bs])
+
+    def _launch_all():
+        bi = torch.arange(bs, device=dev)
+        last = (st["lens"] - 1).clamp(min=0)
+        st["node"].copy_(st["acc"][bi, last] % N)
+        stk = _WY.get("stack")
+        if stk is not None and stk["pool"] is not None and stk["n"] == len(_WY["layers"]) \
+                and os.environ.get("SGLANG_WY_COMMIT_PER_LAYER") != "1":
+            from sglang.kernels.ops.attention.fla.gdn_tree_wy import gdn_tree_wy_commit_all
+            L = stk["n"]
+            gdn_tree_wy_commit_all(stk["U"][:L], stk["CG"][:L], stk["k"][:L], _WY["aim"][:bs], st["node"],
+                                   stk["pool"], stk["layer_off"][:L], st["midx"], bs)
+            return
+        for lid, ls in _WY["layers"].items():
+            U, CG = ls["U"][:bs], ls["CG"][:bs]
+            gdn_tree_wy_commit_inplace(U, CG, ls["k"][:bs].view(bs * U.shape[2], *ls["k"].shape[-2:]),
+                                       _WY["aim"][:bs], st["node"], ls["ssm_states"], st["midx"])
+
+    if st["graph"] is not None:
+        st["graph"].replay()
+    elif st["warm"] < 2 or torch.cuda.is_current_stream_capturing():
+        st["warm"] += 1
+        _launch_all()
+    else:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            _launch_all()
+        st["graph"] = g
+        g.replay()
+
+
+def dflash_tree_wy_commit(accept_index: torch.Tensor, accept_lens: torch.Tensor, mamba_idx: torch.Tensor) -> None:
+    """After accept: write the accepted node's exact state for every GDN layer from the stored
+    factors (S_a = G_a S0 + sum_{i<=a} (G_a/G_i) u_i k_i^T); the per-node SSM scatter is skipped."""
+    from sglang.kernels.ops.attention.fla.gdn_tree_wy import gdn_tree_wy_commit, gdn_tree_wy_commit_inplace
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import DFS_SSM_COMMITTED
+
+    DFS_SSM_COMMITTED[0] = True
+    if not _WY["layers"]:
+        return
+    bs = accept_index.shape[0]
+    N = _WY["am"].shape[1]
+    if os.environ.get("SGLANG_DFLASH_TREE_WY_DEBUG") != "1" and os.environ.get("SGLANG_DFLASH_TREE_WY_EAGER_COMMIT") != "1":
+        return _wy_commit_graphed(accept_index, accept_lens, mamba_idx, bs, N)
+    bi = torch.arange(bs, device=accept_index.device)
+    last = (accept_lens[:bs].to(torch.int64) - 1).clamp(min=0)
+    acc_node = (accept_index[bi, last] % N).to(torch.int64)
+    aim = _WY["aim"][:bs].bool()
+    idx = mamba_idx[:bs].to(torch.int64)
+    for lid, st in _WY["layers"].items():
+        U, CG, kraw, ssm = st["U"][:bs], st["CG"][:bs], st["k"][:bs], st["ssm_states"]
+        HV = U.shape[1]
+        if "dbg" not in st:
+            gdn_tree_wy_commit_inplace(U, CG, st["k"][:bs].view(bs * U.shape[2], *st["k"].shape[-2:]),
+                                       _WY["aim"][:bs], acc_node.to(torch.int32), ssm, idx.to(torch.int32))
+            continue
+        kn = kraw.float().repeat_interleave(HV // kraw.shape[2], dim=2)
+        kn = (kn / torch.sqrt((kn * kn).sum(-1, keepdim=True) + 1e-6)).permute(0, 2, 1, 3)
+        S0 = ssm[idx]
+        new_state = gdn_tree_wy_commit(S0, U, CG, kn, aim, acc_node).to(ssm.dtype)
+        if "dbg" in st and lid in (0, 24):
+            from sglang.kernels.ops.attention.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update_fwd
+
+            d = st["dbg"]; T = U.shape[2]
+            scratch = torch.zeros((bs, T, *ssm.shape[1:]), dtype=torch.float32, device=U.device)
+            ssm_c = ssm.clone()
+            ref = fused_recurrent_gated_delta_rule_update_fwd(
+                d["q"], kraw, d["v"], d["g"], d["beta"], d["q"].shape[-1] ** -0.5, ssm_c, d["cache_indices"],
+                use_qk_l2norm_in_kernel=True, disable_state_update=True, intermediate_states_buffer=scratch,
+                intermediate_state_indices=torch.arange(bs, device=U.device, dtype=torch.int32),
+                cache_steps=T, retrieve_parent_token=d["parents"],
+            ).view(bs, T, HV, -1)
+            do = (ref.float() - d["o"].float()).abs()
+            ref_state = scratch[bi, acc_node]
+            ds = (ref_state - new_state.float()).abs()
+            logger.info(
+                "WY commit debug layer=%d bs=%d acc_node=%s idx=%s cache_idx=%s |o-ref| max=%.3e mean=%.3e ref|o|=%.3e | state |d| max=%.3e mean=%.3e ref|S|=%.3e |S0-Sref|=%.3e",
+                lid, bs, acc_node.tolist(), idx.tolist(), d["cache_indices"].tolist(), do.max().item(), do.mean().item(),
+                ref.float().abs().mean().item(), ds.max().item(), ds.mean().item(), ref_state.abs().mean().item(),
+                (ref_state - S0.float()).abs().max().item(),
+            )
+        ssm[idx] = new_state
+
+
+_DFS_COMMIT_STATIC: dict = {}  # bs -> static commit inputs + captured graph
+_DFS_STACK: dict = {}  # "q","k","v","g","beta": [L, cap, T, ...] stacked over mamba layers; "pool": temporal pool
+
+
+def _ensure_dfs_stash(layer_id, q4, k4, v4, g4, beta4, ssm_states, cache_indices, cap):
+    """Persistent per-layer buffers holding the verify-window inputs of the last
+    step (read by the next step's deferred commit) + pending-commit tables."""
+    bs, T = q4.shape[0], q4.shape[1]
+    pool = getattr(ssm_states, "_base", None)
+    if pool is None or pool.dim() != 5:
+        raise RuntimeError("DFS verify needs ssm_states to be a layer view of the temporal pool")
+    L, S = pool.shape[0], pool.shape[1]
+    if not _DFS_STACK or _DFS_STACK["q"].shape[1] < bs or _DFS_STACK["q"].shape[2] != T:
+        if torch.cuda.is_current_stream_capturing() and _DFS_STACK:
+            raise RuntimeError("DFS verify stash too small during CUDA graph capture")
+        n = max(bs, cap)
+        dev = q4.device
+        mk = lambda t: torch.empty((L, n, T, *t.shape[2:]), dtype=t.dtype, device=dev)
+        _DFS_STACK.update(
+            q=mk(q4), k=mk(k4), v=mk(v4), g=mk(g4), beta=mk(beta4), pool=pool,
+            prev_row=torch.full((n,), -1, dtype=torch.int64, device=dev),
+            prev_chain=torch.full((n, T), -1, dtype=torch.int64, device=dev),
+            pend_row=torch.full((S,), -1, dtype=torch.int64, device=dev),
+            pend_chain=torch.full((S, T), -1, dtype=torch.int64, device=dev),
+            layer_of={},
+        )
+        logger.info("DFS verify stash allocated: L=%d cap=%d T=%d slots=%d", L, n, T, S)
+    off = (ssm_states.data_ptr() - pool.data_ptr()) // (pool.stride(0) * pool.element_size())
+    li = int(off)
+    _DFS_STACK["layer_of"][layer_id] = li
+    _DFS_VERIFY_STASH[layer_id] = (ssm_states, cache_indices)
+    return li
+
+
+def dflash_tree_dfs_prepare(mamba_idx: torch.Tensor) -> None:
+    """Before the verify forward: gather each request's pending accepted path
+    (from its slot) into the graph-static prev_row / prev_chain buffers."""
+    if not _DFS_STACK:
+        return
+    bs = mamba_idx.shape[0]
+    st = _DFS_STACK
+    st["prev_row"][:bs].copy_(st["pend_row"][mamba_idx])
+    st["prev_chain"][:bs].copy_(st["pend_chain"][mamba_idx])
+
+
+def dflash_tree_dfs_record(accept_index: torch.Tensor, accept_lens: torch.Tensor, mamba_idx: torch.Tensor) -> None:
+    """After accept: remember the accepted path per slot; it is committed by the
+    next verify launch (deferred commit). The per-node SSM scatter is skipped."""
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import DFS_SSM_COMMITTED
+
+    DFS_SSM_COMMITTED[0] = True
+    if not _DFS_STACK:
+        return
+    st = _DFS_STACK
+    T = st["q"].shape[2]
+    bs, ncol = accept_index.shape
+    pos = torch.arange(ncol, device=accept_index.device).unsqueeze(0)
+    keep = (accept_index >= 0) & (pos < accept_lens[:bs].to(torch.int64).unsqueeze(1))
+    nodes = torch.where(keep, accept_index % T, torch.full_like(accept_index, -1)).to(torch.int64)
+    chain = torch.full((bs, T), -1, dtype=torch.int64, device=accept_index.device)
+    chain[:, : min(ncol, T)] = nodes[:, :T]
+    st["pend_chain"][mamba_idx] = chain
+    st["pend_row"][mamba_idx] = torch.arange(bs, device=accept_index.device)
+
+
+def dflash_tree_dfs_clear(mamba_idx: torch.Tensor) -> None:
+    """Slots (re)initialised by a prefill carry no pending commit."""
+    if _DFS_STACK:
+        _DFS_STACK["pend_row"][mamba_idx] = -1
+
+
+def dflash_tree_dfs_commit(
+    accept_index: torch.Tensor, accept_lens: torch.Tensor, cache_indices: torch.Tensor
+) -> int:
+    """Commit-by-replay for DFS tree verify: re-run the accepted path of every
+    mamba layer through the recurrence from the persistent SSM state and write
+    the end state back. One launch per layer, captured in a per-bs CUDA graph."""
+    from sglang.kernels.ops.attention.fla.fused_recurrent_gdn_tree_dfs import (
+        fused_recurrent_gdn_tree_dfs,
+    )
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import DFS_SSM_COMMITTED
+
+    if not _DFS_STACK:
+        return 0
+    DFS_SSM_COMMITTED[0] = True
+    T = _DFS_STACK["q"].shape[2]
+    bs, ncol = accept_index.shape
+    dev = accept_index.device
+    key = (bs, ncol)
+    st = _DFS_COMMIT_STATIC.get(key)
+    if st is None:
+        st = dict(
+            acc=torch.full((bs, ncol), -1, dtype=torch.int64, device=dev),
+            lens=torch.zeros((bs,), dtype=torch.int64, device=dev),
+            chain=torch.full((bs, T), -1, dtype=torch.int64, device=dev),
+            nt=torch.full((bs, T), -1, dtype=torch.int64, device=dev),
+            nt_ext=torch.full((bs, T + 1), -1, dtype=torch.int64, device=dev),
+            zeros=torch.zeros((bs, T), dtype=torch.int64, device=dev),
+            cidx=torch.zeros((bs,), dtype=torch.int64, device=dev),
+            pos=torch.arange(ncol, device=dev).unsqueeze(0),
+            graph=None, warm=0,
+        )
+        _DFS_COMMIT_STATIC[key] = st
+    # dynamic inputs -> static buffers (the rest is fixed-shape and graph-captured)
+    st["acc"].copy_(accept_index)
+    st["lens"].copy_(accept_lens[:bs])
+    st["cidx"].copy_(cache_indices[:bs])
+
+    def _prep():
+        keep = (st["acc"] >= 0) & (st["pos"] < st["lens"].unsqueeze(1))
+        nodes = torch.where(keep, st["acc"] % T, torch.full_like(st["acc"], -1))
+        st["chain"].fill_(-1)
+        st["chain"][:, :ncol] = nodes[:, :T] if ncol > T else nodes
+        src, dst = st["chain"][:, :-1], st["chain"][:, 1:]
+        ok = (src >= 0) & (dst >= 0)
+        st["nt_ext"].fill_(-1)
+        st["nt_ext"].scatter_(1, torch.where(ok, src, torch.full_like(src, T)), torch.where(ok, dst, torch.full_like(dst, -1)))
+        st["nt"].copy_(st["nt_ext"][:, :T])
+
+    def _launch_all():
+        _prep()
+        for layer_id, (ssm_states, _ci) in _DFS_VERIFY_STASH.items():
+            li = _DFS_STACK["layer_of"][layer_id]
+            q4 = _DFS_STACK["q"][li, :bs]
+            fused_recurrent_gdn_tree_dfs(
+                q4, _DFS_STACK["k"][li, :bs], _DFS_STACK["v"][li, :bs],
+                _DFS_STACK["g"][li, :bs], _DFS_STACK["beta"][li, :bs], q4.shape[-1] ** -0.5,
+                ssm_states, st["cidx"], st["nt"], st["chain"], st["chain"],
+                use_qk_l2norm_in_kernel=True, pre_node=st["chain"], pre_pop=st["zeros"],
+                write_final_state=True,
+            )
+
+    if st["graph"] is not None:
+        st["graph"].replay()
+    elif st["warm"] < 2 or torch.cuda.is_current_stream_capturing():
+        st["warm"] += 1
+        _launch_all()
+    else:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            _launch_all()
+        st["graph"] = g
+        g.replay()
+    return len(_DFS_VERIFY_STASH)
 
 
 class GDNAttnBackend(MambaAttnBackendBase):
@@ -969,6 +1469,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_next_token = forward_metadata.retrieve_next_token
         retrieve_next_sibling = forward_metadata.retrieve_next_sibling
         retrieve_parent_token = forward_metadata.retrieve_parent_token
+        tree_pre_node = getattr(forward_metadata, "tree_pre_node", None)
+        tree_pre_pop = getattr(forward_metadata, "tree_pre_pop", None)
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
@@ -1160,6 +1662,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     intermediate_state_indices=intermediate_state_indices,
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
+                    tree_pre_node=tree_pre_node,
+                    tree_pre_pop=tree_pre_pop,
+                    dfs_layer_id=layer.layer_id,
+                    tree_next_token=retrieve_next_token,
+                    tree_next_sibling=forward_metadata.retrieve_next_sibling,
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:

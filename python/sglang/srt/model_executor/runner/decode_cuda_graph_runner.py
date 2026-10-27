@@ -1525,6 +1525,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.spec_info is not None
         ):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
+        elif (
+            not is_ragged
+            and forward_batch.spec_info is not None
+            and getattr(forward_batch.spec_info, "tree_ancestor_mask", None) is not None
+            and not self.model_runner.is_draft_worker
+        ):
+            # DFLASH tree verify: kernels captured against the static ancestor
+            # matrix (kpool indexer filter) must see this step's matrix.
+            from sglang.srt.speculative.dflash_info import get_dflash_tree_anc_static
+
+            anc = forward_batch.spec_info.tree_ancestor_mask
+            num_nodes = anc.shape[-1]
+            static_anc = get_dflash_tree_anc_static(self.model_runner.device, num_nodes)
+            rows = anc.numel() // num_nodes
+            static_anc[:rows].copy_(anc.reshape(rows, num_nodes))
 
         attn_backend = self._replay_attn_backend()
         fb_view = build_replay_fb_view(
@@ -1716,7 +1731,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     device=self.model_runner.device,
                 )
         elif self.model_runner.spec_algorithm.is_dflash_family():
-            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+            from sglang.srt.speculative.dflash_info import (
+    DFlashVerifyInput,
+    get_dflash_tree_anc_static,
+)
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,
             )
@@ -1726,6 +1744,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            tree_nodes = get_spec().speculative_dflash_tree_nodes
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,
@@ -1734,6 +1753,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
                     else self.buffers.custom_mask
+                ),
+                tree_ancestor_mask=(
+                    get_dflash_tree_anc_static(
+                        self.model_runner.device, self.captured_req_width
+                    )
+                    if tree_nodes is not None and not self.model_runner.is_draft_worker
+                    else None
                 ),
                 capture_hidden_mode=(
                     CaptureHiddenMode.NULL

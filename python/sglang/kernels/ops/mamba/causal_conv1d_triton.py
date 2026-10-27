@@ -6,6 +6,7 @@
 
 from typing import List, Optional, Union
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -1018,6 +1019,189 @@ def _causal_conv1d_update_kernel(
             )
 
 
+
+@triton.jit()
+def _causal_conv1d_update_tree_kernel(
+    # Tree verify: every draft node convolves over its own ancestor path (parent,
+    # grandparent, ...; the pre-tree conv state beyond the root). All nodes of a
+    # request are computed in parallel from a precomputed parent table instead of
+    # the serial next_token/next_sibling walk of _causal_conv1d_update_kernel.
+    x_ptr,  # (batch, dim, seqlen)
+    w_ptr,  # (dim, width)
+    bias_ptr,
+    conv_state_ptr,
+    conv_state_indices_ptr,
+    intermediate_conv_window_ptr,
+    intermediate_state_indices_ptr,
+    parent_ptr,  # (batch, seqlen) parent node of each node (root: any)
+    o_ptr,  # (batch, dim, seqlen)
+    batch: int,
+    dim: tl.constexpr,
+    seqlen: tl.constexpr,
+    state_len: tl.constexpr,
+    num_cache_lines: tl.constexpr,
+    stride_x_seq: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_conv_state_seq: tl.constexpr,
+    stride_conv_state_dim: tl.constexpr,
+    stride_conv_state_tok: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    stride_inter_seq: tl.constexpr,
+    stride_inter_step: tl.constexpr,
+    stride_inter_dim: tl.constexpr,
+    stride_inter_win: tl.constexpr,
+    stride_intermediate_state_indices: tl.constexpr,
+    stride_parent_seq: tl.constexpr,
+    stride_parent_token: tl.constexpr,
+    stride_o_seq: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    IS_CONTINUOUS_BATCHING: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SAVE_INTERMEDIATE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    idx_seq = tl.program_id(0)
+    if idx_seq >= batch:
+        return
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_tb = tl.program_id(2)
+    if IS_CONTINUOUS_BATCHING:
+        conv_state_batch_coord = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices
+        ).to(tl.int64)
+        if SAVE_INTERMEDIATE:
+            intermediate_state_batch_coord = tl.load(
+                intermediate_state_indices_ptr
+                + idx_seq * stride_intermediate_state_indices
+            ).to(tl.int64)
+    else:
+        conv_state_batch_coord = idx_seq
+        intermediate_state_batch_coord = idx_seq
+    if USE_PAD_SLOT:  # noqa
+        if conv_state_batch_coord == pad_slot_id:
+            return
+    mask_w = idx_feats < dim
+    conv_states_base = (
+        conv_state_ptr
+        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (idx_feats * stride_conv_state_dim)
+    )
+    # pre-tree inputs: col0 oldest ... col{W-2} most recent (same as the serial kernel)
+    col0 = tl.load(conv_states_base, mask_w, 0.0)
+    if KERNEL_WIDTH >= 3:
+        col1 = tl.load(conv_states_base + 1 * stride_conv_state_tok, mask_w, 0.0)
+    if KERNEL_WIDTH >= 4:
+        col2 = tl.load(conv_states_base + 2 * stride_conv_state_tok, mask_w, 0.0)
+
+    # No in-kernel state roll: in tree verify the conv state is rewritten by the
+    # post-accept window scatter, and a roll here would race with the col loads of
+    # the other token-block programs (the serial kernel's roll only ever stored
+    # tree-order garbage that the scatter overwrote).
+    if HAS_BIAS:
+        acc = tl.load(bias_ptr + idx_feats, mask=mask_w, other=0.0).to(tl.float32)[None, :]
+    else:
+        acc = tl.zeros((1, BLOCK_N), dtype=tl.float32)
+    acc = tl.broadcast_to(acc, (BLOCK_T, BLOCK_N))
+
+    tok = idx_tb * BLOCK_T + tl.arange(0, BLOCK_T)  # [BLOCK_T]
+    m_tok = tok < seqlen
+    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    par_base = parent_ptr + idx_seq * stride_parent_seq
+    # node = hop^j(tok): positive -> tree node, 0 -> root, <0 -> pre-tree state columns
+    node = tok.to(tl.int64)
+    for j in tl.static_range(KERNEL_WIDTH):
+        w_j = tl.load(w_ptr + idx_feats * stride_w_dim + (KERNEL_WIDTH - 1 - j) * stride_w_width, mask_w, other=0.0)
+        in_tree = (node >= 0) & m_tok
+        xp = x_base[None, :] + (tl.maximum(node, 0) * stride_x_token)[:, None]
+        xv = tl.load(xp, in_tree[:, None] & mask_w[None, :], 0.0)
+        if KERNEL_WIDTH == 2:
+            sv = col0[None, :]
+        elif KERNEL_WIDTH == 3:
+            sv = tl.where((node == -1)[:, None], col1[None, :], col0[None, :])
+        else:
+            sv = tl.where((node == -1)[:, None], col2[None, :], tl.where((node == -2)[:, None], col1[None, :], col0[None, :]))
+        xj = tl.where(in_tree[:, None], xv, sv)
+        if SAVE_INTERMEDIATE:
+            if KERNEL_WIDTH - j - 2 >= 0:
+                wp = (
+                    intermediate_conv_window_ptr
+                    + intermediate_state_batch_coord * stride_inter_seq
+                    + (tok * stride_inter_step)[:, None]
+                    + (idx_feats * stride_inter_dim)[None, :]
+                    + (KERNEL_WIDTH - j - 2) * stride_inter_win
+                )
+                tl.store(wp, xj, m_tok[:, None] & mask_w[None, :])
+        acc += xj * w_j[None, :]
+        # next ancestor
+        par = tl.load(par_base + tl.maximum(node, 0) * stride_parent_token, mask=node > 0, other=0).to(tl.int64)
+        node = tl.where(node > 0, par, node - 1)
+    if SILU_ACTIVATION:
+        acc = acc / (1 + tl.exp(-acc))
+    op = (
+        o_ptr
+        + idx_seq * stride_o_seq
+        + (tok * stride_o_token)[:, None]
+        + (idx_feats * stride_o_dim)[None, :]
+    )
+    tl.store(op, acc, m_tok[:, None] & mask_w[None, :])
+
+
+def causal_conv1d_update_tree(
+    x, conv_state, weight, bias, activation, *, conv_state_indices, intermediate_conv_window,
+    intermediate_state_indices, parents, pad_slot_id=PAD_SLOT_ID, block_t=16,
+):
+    """Tree-parallel variant of causal_conv1d_update for target verify (x: (batch, dim, N)).
+    `parents` [batch, N]: parent node id per node (root's entry unused). Writes the same
+    output / intermediate window / rolled state as the serial tree kernel."""
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    batch, dim, seqlen = x.shape
+    _, width = weight.shape
+    num_cache_lines, _, _ = conv_state.size()
+    state_len = width - 1
+    out = torch.empty_like(x)
+    sw = weight.stride(); sx = x.stride(); so = out.stride(); ss = conv_state.stride()
+    si = intermediate_conv_window.stride() if intermediate_conv_window is not None else (0, 0, 0, 0)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    BLOCK_T = min(block_t, triton.next_power_of_2(seqlen))
+    grid = (batch, triton.cdiv(dim, 256), triton.cdiv(seqlen, BLOCK_T))
+    _causal_conv1d_update_tree_kernel[grid](
+        x, weight, bias, conv_state, conv_state_indices,
+        intermediate_conv_window if intermediate_conv_window is not None else x,
+        intermediate_state_indices, parents, out,
+        batch, dim, seqlen, state_len, num_cache_lines,
+        sx[0], sx[1], sx[2], sw[0], sw[1], ss[0], ss[1], ss[2],
+        conv_state_indices.stride(0) if conv_state_indices is not None else 0,
+        si[0], si[1], si[2], si[3],
+        intermediate_state_indices.stride(0) if intermediate_state_indices is not None else 0,
+        parents.stride(0), parents.stride(1),
+        so[0], so[1], so[2],
+        pad_slot_id,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ["silu", "swish"],
+        IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
+        USE_PAD_SLOT=pad_slot_id is not None,
+        BLOCK_N=256,
+        BLOCK_T=BLOCK_T,
+        SAVE_INTERMEDIATE=intermediate_conv_window is not None,
+        **pdl_kwargs,
+    )
+    return out
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1064,6 +1248,19 @@ def causal_conv1d_update(
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
         assert pad_slot_id is not None
         assert x.stride(1) == 1
+    if (
+        retrieve_next_token is not None
+        and retrieve_parent_token is not None
+        and x.dim() == 3
+        and num_accept_tokens is None
+        and os.environ.get("SGLANG_CONV_TREE_PARALLEL") == "1"
+    ):
+        return causal_conv1d_update_tree(
+            x, conv_state, weight, bias, activation, conv_state_indices=conv_state_indices,
+            intermediate_conv_window=intermediate_conv_window,
+            intermediate_state_indices=intermediate_state_indices, parents=retrieve_parent_token,
+            pad_slot_id=pad_slot_id,
+        )
     if isinstance(activation, bool):
         activation = "silu" if activation is True else None
     elif activation is not None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
@@ -60,6 +62,22 @@ class IndexKeyCache:
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        if self.pool.index_page_size != 1:
+            # Rows are pages, not tokens: move per token inside the page layout,
+            # all layers in two launches.
+            if os.environ.get("SGLANG_DSA_INDEX_MOVE_PER_LAYER") == "1":
+                for index_k in self.buffer:
+                    if index_k.shape[0] == 0:
+                        continue
+                    index_buf_accessor.MoveKAndS.execute(
+                        self.pool, self._kernel_view(index_k), tgt_loc_flat, src_loc_flat
+                    )
+                return
+            bufs = [self._kernel_view(b) for b in self.buffer if b.shape[0] != 0]
+            index_buf_accessor.MoveKAndSAllLayers.execute(
+                self.pool, bufs, tgt_loc_flat, src_loc_flat
+            )
+            return
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue

@@ -331,7 +331,37 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_num_steps=1,
         )
 
-    if cfg.speculative_eagle_topk is None:
+    tree_nodes = cfg.speculative_dflash_tree_nodes
+    if tree_nodes is not None:
+        if int(tree_nodes) < 2:
+            raise ValueError(
+                "DFLASH requires --speculative-dflash-tree-nodes >= 2, "
+                f"got {tree_nodes}."
+            )
+        # Tree verify: the hybrid linear-attention and flash-attention backends
+        # gate their tree metadata on speculative_eagle_topk > 1; the value is
+        # otherwise unused by DFLASH (the tree width comes from the selector).
+        if cfg.speculative_eagle_topk is None or int(cfg.speculative_eagle_topk) <= 1:
+            declare_resolution(
+                server_args,
+                "_handle_dflash",
+                speculative_eagle_topk=2,
+            )
+        if (
+            cfg.speculative_num_draft_tokens is not None
+            and int(cfg.speculative_num_draft_tokens) != int(tree_nodes)
+        ):
+            raise ValueError(
+                "DFLASH tree verify sets --speculative-num-draft-tokens to the tree "
+                f"size; got {cfg.speculative_num_draft_tokens} vs "
+                f"--speculative-dflash-tree-nodes {tree_nodes}."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            speculative_num_draft_tokens=int(tree_nodes),
+        )
+    elif cfg.speculative_eagle_topk is None:
         declare_resolution(
             server_args,
             "_handle_dflash",
@@ -348,7 +378,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_eagle_topk=1,
         )
 
-    if cfg.speculative_dflash_block_size is not None:
+    if tree_nodes is None and cfg.speculative_dflash_block_size is not None:
         if int(cfg.speculative_dflash_block_size) <= 0:
             raise ValueError(
                 "DFLASH requires --speculative-dflash-block-size to be positive, "

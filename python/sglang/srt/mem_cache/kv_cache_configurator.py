@@ -123,6 +123,19 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+
+def _dfs_intermediate_steps(draft_tokens: int) -> int:
+    """DFS tree verify (SGLANG_DFLASH_TREE_DFS_VERIFY=1) keeps no per-node SSM
+    snapshots, so the intermediate_ssm scratch shrinks to one step."""
+    import os
+
+    if (
+        (os.environ.get("SGLANG_DFLASH_TREE_DFS_VERIFY") == "1" or os.environ.get("SGLANG_DFLASH_TREE_WY_VERIFY") == "1")
+        and getattr(get_spec(), "speculative_dflash_tree_nodes", None) is not None
+    ):
+        return 1
+    return draft_tokens
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
@@ -2994,7 +3007,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     stage_per_req
                     * (capped_reqs + 1)
-                    * get_spec().speculative_num_draft_tokens
+                    * _dfs_intermediate_steps(get_spec().speculative_num_draft_tokens)
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -3032,7 +3045,7 @@ class KVCacheConfigurator:
 
             if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
-                D = get_spec().speculative_num_draft_tokens
+                D = _dfs_intermediate_steps(get_spec().speculative_num_draft_tokens)
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(
                     "mamba_pool.memory_budget_spec",

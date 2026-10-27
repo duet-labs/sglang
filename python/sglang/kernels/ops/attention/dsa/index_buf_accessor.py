@@ -719,3 +719,178 @@ def _get_k_and_s_triton_kernel(
     s_dst_base_offset = s_dst_token_offset * 4
     s_store_addr = s_out_ptr + s_dst_base_offset[:, None] + s_offsets[None, :]
     tl.store(s_store_addr, s_data, mask=s_mask)
+
+
+class MoveKAndS:
+    """Token-granular move of index-K (+scale) inside the paged buffer.
+
+    ``IndexKeyCache.move`` row-indexes ``buf`` with token locations, which is
+    only right for page_size == 1; with 64-token pages it reads/writes whole
+    pages at row = token loc (OOB past num_pages). Gather the src tokens with
+    the Set layout, then write them at tgt with ``SetKAndS`` (two launches, so
+    overlapping src/tgt slots cannot race).
+    """
+
+    @classmethod
+    def execute(cls, pool, buf, tgt_loc, src_loc):
+        page_size = pool.index_page_size
+        num_pages, buf_numel_per_page = buf.shape
+        index_head_dim = pool.index_head_dim
+        n = src_loc.numel()
+        if n == 0:
+            return
+        src_loc = src_loc.to(torch.int64).contiguous()
+        tgt_loc = tgt_loc.to(torch.int64).contiguous()
+        if _is_fp8_fnuz:
+            buf_fp8 = buf.view(torch.float8_e4m3fnuz)
+        else:
+            buf_fp8 = buf.view(torch.float8_e4m3fn)
+        k = torch.empty((n, index_head_dim), dtype=buf_fp8.dtype, device=buf.device)
+        s = torch.empty((n,), dtype=torch.float32, device=buf.device)
+        _gather_k_and_s_triton_kernel[(n,)](
+            buf_fp8,
+            buf.view(torch.float32),
+            src_loc,
+            k,
+            s,
+            PAGE_SIZE=page_size,
+            BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+            NUM_K_ELEMS_PER_TOKEN=index_head_dim,
+            S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+            PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
+        )
+        _set_k_and_s_triton(buf=buf, loc=tgt_loc, index_k=k, index_k_scale=s, page_size=page_size)
+
+
+@triton.jit
+def _gather_k_and_s_triton_kernel(
+    buf_fp8_ptr,
+    buf_fp32_ptr,
+    loc_ptr,
+    out_k_ptr,
+    out_s_ptr,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile_id = loc_token_offset_in_page // tile
+        token_in_tile = loc_token_offset_in_page % tile
+        col_tile_id = k_range // tile
+        col_in_tile = k_range % tile
+        k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + token_tile_id * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile_id * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
+            + k_range
+        )
+    s_offset = (
+        loc_page_index * BUF_NUMEL_PER_PAGE // 4
+        + S_OFFSET_NBYTES_IN_PAGE // 4
+        + loc_token_offset_in_page
+    )
+    k = tl.load(buf_fp8_ptr + k_offsets)
+    tl.store(out_k_ptr + token_id * NUM_K_ELEMS_PER_TOKEN + k_range, k)
+    tl.store(out_s_ptr + token_id, tl.load(buf_fp32_ptr + s_offset))
+
+
+class MoveKAndSAllLayers:
+    """``MoveKAndS`` over every layer in two launches (gather all, then scatter all)
+    instead of 2 x num_layers; per-layer buffers are addressed through a device
+    array of their base pointers."""
+
+    @classmethod
+    def execute(cls, pool, bufs, tgt_loc, src_loc):
+        n = src_loc.numel()
+        if n == 0 or len(bufs) == 0:
+            return
+        page_size = pool.index_page_size
+        num_pages, buf_numel_per_page = bufs[0].shape
+        index_head_dim = pool.index_head_dim
+        L = len(bufs)
+        dev = bufs[0].device
+        ptrs = getattr(pool, "_index_k_move_ptrs", None)
+        if ptrs is None or ptrs.numel() != L:
+            ptrs = torch.tensor([b.data_ptr() for b in bufs], dtype=torch.int64, device=dev)
+            pool._index_k_move_ptrs = ptrs
+        src_loc = src_loc.to(torch.int64).contiguous()
+        tgt_loc = tgt_loc.to(torch.int64).contiguous()
+        k = torch.empty((L, n, index_head_dim), dtype=torch.uint8, device=dev)
+        s = torch.empty((L, n), dtype=torch.float32, device=dev)
+        common = dict(
+            PAGE_SIZE=page_size,
+            BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+            NUM_K_ELEMS_PER_TOKEN=index_head_dim,
+            S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+            PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
+        )
+        _move_k_and_s_layers_kernel[(n, L)](ptrs, src_loc, k, s, n, GATHER=True, **common)
+        _move_k_and_s_layers_kernel[(n, L)](ptrs, tgt_loc, k, s, n, GATHER=False, **common)
+
+
+@triton.jit
+def _move_k_and_s_layers_kernel(
+    ptrs_ptr,
+    loc_ptr,
+    tmp_k_ptr,
+    tmp_s_ptr,
+    n_tokens,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+    GATHER: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    layer = tl.program_id(1)
+    base = tl.load(ptrs_ptr + layer).to(tl.pointer_type(tl.uint8))
+    loc = tl.load(loc_ptr + token_id)
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile_id = loc_token_offset_in_page // tile
+        token_in_tile = loc_token_offset_in_page % tile
+        col_tile_id = k_range // tile
+        col_in_tile = k_range % tile
+        k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + token_tile_id * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile_id * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
+            + k_range
+        )
+    s_ptr = (base + loc_page_index * BUF_NUMEL_PER_PAGE + S_OFFSET_NBYTES_IN_PAGE).to(
+        tl.pointer_type(tl.float32)
+    ) + loc_token_offset_in_page
+    tmp_k = tmp_k_ptr + (layer * n_tokens + token_id) * NUM_K_ELEMS_PER_TOKEN + k_range
+    tmp_s = tmp_s_ptr + layer * n_tokens + token_id
+    if GATHER:
+        tl.store(tmp_k, tl.load(base + k_offsets))
+        tl.store(tmp_s, tl.load(s_ptr))
+    else:
+        tl.store(base + k_offsets, tl.load(tmp_k))
+        tl.store(s_ptr, tl.load(tmp_s))

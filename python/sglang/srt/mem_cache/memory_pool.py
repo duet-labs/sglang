@@ -130,6 +130,18 @@ if _is_xpu:
     from sgl_kernel import store_cache_xpu
 
 
+
+def _dfs_intermediate_steps(draft_tokens: int) -> int:
+    """DFS tree verify keeps no per-node SSM snapshots -> 1-step scratch."""
+    from sglang.srt.runtime_context import get_spec
+
+    if (
+        (os.environ.get("SGLANG_DFLASH_TREE_DFS_VERIFY") == "1" or os.environ.get("SGLANG_DFLASH_TREE_WY_VERIFY") == "1")
+        and getattr(get_spec(), "speculative_dflash_tree_nodes", None) is not None
+    ):
+        return 1
+    return draft_tokens
+
 def conv_window_dedup_enabled(
     is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int], is_kda: bool
 ) -> bool:
@@ -882,7 +894,7 @@ class MambaPool:
                         size=(
                             num_mamba_layers,
                             spec_state_size + 1,
-                            speculative_num_draft_tokens,
+                            _dfs_intermediate_steps(speculative_num_draft_tokens),
                             temporal_state_shape[0],
                             temporal_state_shape[1],
                             temporal_state_shape[2],
@@ -5425,7 +5437,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
-        super().move_kv_cache(tgt_loc, src_loc)
+        if os.environ.get("SGLANG_DSA_FUSED_KV_MOVE", "1") == "1" and tgt_loc.numel() > 0:
+            # all layers in two launches instead of 78 x (gather + index_put)
+            from sglang.srt.mem_cache.fused_row_move import move_rows_all_layers
+
+            move_rows_all_layers(self.kv_buffer, tgt_loc.view(-1), src_loc.view(-1))
+        else:
+            super().move_kv_cache(tgt_loc, src_loc)
+        if self.index_kpool > 1:
+            # Pooled index cache is page-indexed (page_size/kpool rows per page);
+            # per-token moves are undefined there. DFLASH tree accept re-pools
+            # the accepted path via dflash_tree_kpool_replay instead.
+            return
         self.index_key_cache.move(tgt_loc, src_loc)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
