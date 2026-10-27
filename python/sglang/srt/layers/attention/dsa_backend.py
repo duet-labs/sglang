@@ -3852,6 +3852,15 @@ class DeepseekSparseAttnBackend(
                     rope_positions = get_cp_strategy().shard_position_ids(
                         rope_positions, forward_batch
                     )
+                # Interleave BCG narrows q to the live local rows but hands k
+                # and k_rope over with the CP-aligned physical shard; the fused
+                # rope/quantize kernel needs one nnz, and the live rows are a
+                # prefix of the shard.
+                n_q = q.shape[0]
+                if dsa_use_prefill_cp(forward_batch) and k.shape[0] > n_q:
+                    k = k[:n_q]
+                    k_rope = k_rope[:n_q]
+                    rope_positions = rope_positions[:n_q]
 
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
